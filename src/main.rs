@@ -1,7 +1,5 @@
 //! pr-triage: a terminal UI for triaging your open pull requests.
 
-//! pr-triage: a terminal UI for triaging your open pull requests.
-
 mod app;
 mod github;
 mod model;
