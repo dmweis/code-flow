@@ -7,7 +7,7 @@ repository, with their review, CI, and merge status at a glance.
 
 ## Install
 
-Requires the [GitHub CLI](https://cli.github.com/), logged in with `gh auth login`.
+Requires Rust 1.88 or newer and the [GitHub CLI](https://cli.github.com/), logged in with `gh auth login`.
 
 ```sh
 cargo install --path .
