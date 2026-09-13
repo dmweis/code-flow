@@ -9,7 +9,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 
-use crate::github;
+use crate::github::{self, Checkout};
 use crate::model::PullRequest;
 use crate::ui;
 
@@ -20,7 +20,7 @@ const FLASH_DURATION: Duration = Duration::from_secs(5);
 /// Results of background work, sent back to the event loop.
 enum Msg {
     Prs(Result<Vec<PullRequest>>),
-    CheckedOut(u64, Result<String>),
+    CheckedOut(u64, Result<Checkout>),
     Opened(Result<()>),
 }
 
@@ -30,12 +30,19 @@ pub struct Flash {
     at: Instant,
 }
 
+/// Asks whether to reset a local branch that has diverged from its PR.
+pub struct ForceCheckoutPrompt {
+    pub number: u64,
+    pub branch: String,
+}
+
 pub struct App {
     pub repo: String,
     pub prs: Vec<PullRequest>,
     pub list: ListState,
     pub detail_scroll: u16,
     pub show_help: bool,
+    pub force_checkout_prompt: Option<ForceCheckoutPrompt>,
     /// When the in-flight fetch started, if one is running.
     pub loading_since: Option<Instant>,
     pub last_success: Option<Instant>,
@@ -75,6 +82,7 @@ impl App {
             list: ListState::default(),
             detail_scroll: 0,
             show_help: false,
+            force_checkout_prompt: None,
             loading_since: None,
             last_success: None,
             last_attempt: None,
@@ -96,8 +104,10 @@ impl App {
     }
 
     fn set_flash(&mut self, text: impl Into<String>, is_error: bool) {
+        // The footer has room for one line; git's first line says what went wrong.
+        let text = text.into().lines().next().unwrap_or_default().to_owned();
         self.flash = Some(Flash {
-            text: text.into(),
+            text,
             is_error,
             at: Instant::now(),
         });
@@ -149,12 +159,16 @@ impl App {
                     }
                 }
             }
-            Msg::CheckedOut(number, Ok(output)) => {
+            Msg::CheckedOut(number, Ok(Checkout::Done(output))) => {
                 let text = match output.is_empty() {
                     true => format!("Checked out #{number}"),
                     false => format!("Checked out #{number}: {output}"),
                 };
                 self.set_flash(text, false);
+            }
+            Msg::CheckedOut(number, Ok(Checkout::Diverged { branch })) => {
+                self.flash = None;
+                self.force_checkout_prompt = Some(ForceCheckoutPrompt { number, branch });
             }
             Msg::CheckedOut(_, Err(err)) | Msg::Opened(Err(err)) => {
                 self.set_flash(format!("{err:#}"), true);
@@ -191,15 +205,20 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
+            return;
+        }
+        if let Some(prompt) = self.force_checkout_prompt.take() {
+            self.on_force_checkout_key(key, prompt);
+            return;
+        }
         if self.show_help {
             self.show_help = false;
             return;
         }
         let current = self.list.selected().unwrap_or(0);
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
-            }
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.select(current + 1),
             KeyCode::Char('k') | KeyCode::Up => self.select(current.saturating_sub(1)),
@@ -225,6 +244,24 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn on_force_checkout_key(&mut self, key: KeyEvent, prompt: ForceCheckoutPrompt) {
+        match key.code {
+            KeyCode::Char('y') => {
+                let (repo, number, branch) = (self.repo.clone(), prompt.number, prompt.branch);
+                self.set_flash(format!("Resetting {branch} to PR #{number}…"), false);
+                self.spawn(move || {
+                    let result = github::force_checkout(&repo, number)
+                        .map(|()| Checkout::Done(format!("reset {branch} to match the PR")));
+                    Msg::CheckedOut(number, result)
+                });
+            }
+            KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => {
+                self.set_flash(format!("Kept local branch {}", prompt.branch), false);
+            }
+            _ => self.force_checkout_prompt = Some(prompt),
         }
     }
 }
@@ -309,5 +346,39 @@ pub(crate) mod tests {
         assert_eq!(app.list.selected(), Some(1));
         app.on_key(press('g'));
         assert_eq!(app.list.selected(), Some(0));
+    }
+
+    /// Only the decline path is tested: accepting spawns a real `gh` command.
+    #[test]
+    fn diverged_checkout_prompts_until_answered() {
+        let mut app = app_with(vec![sample_pr(1, "a"), sample_pr(2, "b")]);
+        let diverged = Checkout::Diverged {
+            branch: "feature".into(),
+        };
+        app.on_msg(Msg::CheckedOut(2, Ok(diverged)));
+        assert_eq!(app.force_checkout_prompt.as_ref().unwrap().number, 2);
+
+        // Other keys are swallowed while the prompt is open.
+        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(app.list.selected(), Some(0));
+        assert!(app.force_checkout_prompt.is_some());
+
+        app.on_key(KeyEvent::from(KeyCode::Char('n')));
+        assert!(app.force_checkout_prompt.is_none());
+        assert!(!app.should_quit);
+        assert_eq!(app.flash().unwrap().text, "Kept local branch feature");
+    }
+
+    #[test]
+    fn flash_keeps_first_line_only() {
+        let mut app = app_with(vec![]);
+        app.set_flash(
+            "error: local changes would be overwritten\n\tREADME.md",
+            true,
+        );
+        assert_eq!(
+            app.flash().unwrap().text,
+            "error: local changes would be overwritten"
+        );
     }
 }

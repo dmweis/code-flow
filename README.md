@@ -39,7 +39,7 @@ The detail pane on the right spells out every status in full and shows the PR de
 | `g`/`G` | first / last PR |
 | `J`/`K`, `PgUp`/`PgDn` | scroll description |
 | `o`, `Enter` | open PR in browser |
-| `c` | `gh pr checkout` the selected PR |
+| `c` | `gh pr checkout` the selected PR; if your local branch has diverged (e.g. the PR was rebased), offers to reset it |
 | `r` | refresh (also automatic every 60s) |
 | `?` | key bindings |
 | `q`, `Esc` | quit |

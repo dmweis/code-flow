@@ -7,9 +7,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph, Wrap};
 
-use crate::app::App;
+use crate::app::{App, ForceCheckoutPrompt};
 use crate::model::{AutoMerge, Ci, CiState, Label, Merge, PullRequest, Review};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -25,6 +25,44 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_help {
         draw_help(frame);
     }
+    if let Some(prompt) = &app.force_checkout_prompt {
+        draw_force_checkout_prompt(frame, prompt);
+    }
+}
+
+fn draw_force_checkout_prompt(frame: &mut Frame, prompt: &ForceCheckoutPrompt) {
+    let lines = vec![
+        Line::from(vec![
+            "Local branch ".into(),
+            prompt.branch.as_str().bold(),
+            format!(" has diverged from PR #{}, ", prompt.number).into(),
+            "probably because the PR was rebased or force-pushed. ".into(),
+            "You are now on the local branch.".into(),
+        ]),
+        Line::default(),
+        Line::from(
+            "Reset it to match the PR? Commits that only exist on the local branch \
+             will be discarded (git reflog can still recover them).",
+        ),
+        Line::default(),
+        Line::from(vec![
+            " y ".bold().black().on_yellow(),
+            " reset branch    ".into(),
+            " n ".bold().reversed(),
+            " keep local branch".into(),
+        ])
+        .centered(),
+    ];
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
+    let width = 60.min(frame.area().width);
+    let height = paragraph.line_count(width.saturating_sub(4)) as u16 + 2;
+    let area = centered(frame.area(), width, height);
+    let block = Block::bordered()
+        .title(" Branch has diverged ".bold())
+        .border_style(Style::new().yellow())
+        .padding(Padding::horizontal(1));
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph.block(block), area);
 }
 
 fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -458,6 +496,20 @@ mod tests {
                 "≡ queued #2"
             ]
         );
+    }
+
+    #[test]
+    fn renders_force_checkout_prompt() {
+        let mut app = app_with(vec![sample_pr(482, "Add retry logic")]);
+        app.force_checkout_prompt = Some(ForceCheckoutPrompt {
+            number: 482,
+            branch: "feature/retry".into(),
+        });
+        let screen = render(&mut app);
+        assert!(screen.contains("Branch has diverged"), "{screen}");
+        assert!(screen.contains("feature/retry"), "{screen}");
+        assert!(screen.contains(" y  reset branch"), "{screen}");
+        assert!(screen.contains(" n  keep local branch"), "{screen}");
     }
 
     #[test]

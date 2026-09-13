@@ -1,6 +1,6 @@
 //! Talks to GitHub through the `gh` CLI so we reuse its authentication.
 
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -53,17 +53,42 @@ const FAILED_STATES: &[&str] = &[
     "ACTION_REQUIRED",
 ];
 
-fn gh(args: &[&str]) -> Result<std::process::Output> {
-    let output = Command::new("gh")
+/// Runs a command, returning its output whether or not it succeeded. Messages
+/// are forced to English so git's errors can be recognized.
+fn run(program: &str, args: &[&str]) -> Result<Output> {
+    Command::new(program)
         .args(args)
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .output()
-        .context("failed to run `gh`; is the GitHub CLI installed and on PATH?")?;
+        .with_context(|| format!("failed to run `{program}`; is it installed and on PATH?"))
+}
+
+fn check(program: &str, args: &[&str], output: Output) -> Result<Output> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("`gh {}` failed: {}", args[..2].join(" "), stderr.trim());
+        bail!(
+            "`{program} {}` failed: {}",
+            args[..2].join(" "),
+            stderr.trim()
+        );
     }
     Ok(output)
+}
+
+fn gh(args: &[&str]) -> Result<Output> {
+    check("gh", args, run("gh", args)?)
+}
+
+fn git(args: &[&str]) -> Result<String> {
+    let output = check("git", args, run("git", args)?)?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// The last line of a command's stderr, where git reports the branch switch.
+fn last_line(output: &Output) -> String {
+    let text = String::from_utf8_lossy(&output.stderr);
+    text.lines().last().unwrap_or_default().trim().to_owned()
 }
 
 /// Resolves the GitHub repository (`owner/name`) for the current directory.
@@ -93,11 +118,47 @@ pub fn fetch_my_prs(repo: &str) -> Result<Vec<PullRequest>> {
     parse_response(&output.stdout)
 }
 
-pub fn checkout(repo: &str, number: u64) -> Result<String> {
-    let output = gh(&["pr", "checkout", &number.to_string(), "--repo", repo])?;
-    // git reports the branch switch on stderr.
-    let text = String::from_utf8_lossy(&output.stderr);
-    Ok(text.lines().last().unwrap_or_default().trim().to_owned())
+pub enum Checkout {
+    Done(String),
+    /// The existing local branch and the PR have diverged, typically because
+    /// the PR was rebased or force-pushed. gh has still switched to the branch.
+    Diverged {
+        branch: String,
+    },
+}
+
+pub fn checkout(repo: &str, number: u64) -> Result<Checkout> {
+    let args = ["pr", "checkout", &number.to_string(), "--repo", repo];
+    let output = run("gh", &args)?;
+    if !output.status.success() && is_diverged(&String::from_utf8_lossy(&output.stderr)) {
+        let branch = git(&["branch", "--show-current"])?;
+        return Ok(Checkout::Diverged { branch });
+    }
+    let output = check("gh", &args, output)?;
+    Ok(Checkout::Done(last_line(&output)))
+}
+
+/// Resets the PR's local branch to the PR head, discarding local-only commits.
+///
+/// When the branch is already checked out, `gh pr checkout --force` runs
+/// `git reset --hard`, so refuse if tracked files have uncommitted changes.
+pub fn force_checkout(repo: &str, number: u64) -> Result<()> {
+    if !git(&["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
+        bail!("You have uncommitted changes; commit or stash them, then check out again");
+    }
+    gh(&[
+        "pr",
+        "checkout",
+        &number.to_string(),
+        "--repo",
+        repo,
+        "--force",
+    ])?;
+    Ok(())
+}
+
+fn is_diverged(stderr: &str) -> bool {
+    stderr.contains("Not possible to fast-forward")
 }
 
 pub fn open_in_browser(repo: &str, number: u64) -> Result<()> {
@@ -524,6 +585,20 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn recognizes_diverged_checkout() {
+        // Captured from `gh pr checkout` with gh 2.100.0 and git 2.54.0.
+        let diverged = "Switched to branch 'mock/readme-requirements'\n\
+            Your branch and 'origin/mock/readme-requirements' have diverged,\n\
+            hint: Diverging branches can't be fast-forwarded, you need to either:\n\
+            fatal: Not possible to fast-forward, aborting.\n\
+            failed to run git: exit status 128";
+        assert!(is_diverged(diverged));
+        let dirty = "error: Your local changes to the following files would be overwritten by checkout:\n\
+            \tREADME.md\nAborting\nfailed to run git: exit status 1";
+        assert!(!is_diverged(dirty));
     }
 
     #[test]
