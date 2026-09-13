@@ -28,6 +28,7 @@ words. Only states worth acting on are shown:
 | Merge | `⚠ conflicts`, `↓ behind base` |
 | Auto-merge | `» auto-merge`, `≡ queued #2` |
 | Threads | `2 threads` unresolved review threads |
+| Worktree | `⌂ worktree` the PR has its own worktree |
 
 The detail pane on the right spells out every status in full and shows the PR description.
 
@@ -40,7 +41,8 @@ The detail pane on the right spells out every status in full and shows the PR de
 | `J`/`K`, `PgUp`/`PgDn` | scroll description |
 | `o`, `Enter` | open PR in browser |
 | `c` | `gh pr checkout` the selected PR; if your local branch has diverged (e.g. the PR was rebased), offers to reset it |
-| `w` | open the PR in a [worktrunk](https://worktrunk.dev) worktree and, inside [Herdr](https://herdr.dev), a Herdr workspace there (both optional) |
+| `w` | open the PR in a [worktrunk](https://worktrunk.dev) worktree and, inside [Herdr](https://herdr.dev), a Herdr workspace there (both optional); if the PR's branch is checked out in your main checkout, offers to move it to a worktree |
+| `W` | remove the PR's worktree and close its Herdr workspace, after confirming |
 | `r` | refresh (also automatic every 60s) |
 | `?` | key bindings |
 | `q`, `Esc` | quit |

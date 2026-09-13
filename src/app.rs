@@ -1,5 +1,6 @@
 //! Application state, input handling, and the main event loop.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,10 +10,10 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 
-use crate::github::{self, Checkout};
+use crate::github::{self, Checkout, Repo};
 use crate::model::PullRequest;
 use crate::ui;
-use crate::worktree::{self, OpenedWorktree};
+use crate::worktree::{self, OpenOutcome};
 
 const TICK: Duration = Duration::from_millis(200);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -20,10 +21,12 @@ const FLASH_DURATION: Duration = Duration::from_secs(5);
 
 /// Results of background work, sent back to the event loop.
 enum Msg {
-    Prs(Result<Vec<PullRequest>>),
+    Prs(Result<Vec<PullRequest>>, HashMap<String, String>),
+    Worktrees(Result<HashMap<String, String>>),
     CheckedOut(u64, Result<Checkout>),
     Opened(Result<()>),
-    OpenedWorktree(u64, Result<OpenedWorktree>),
+    OpenedWorktree(u64, Result<OpenOutcome>),
+    RemovedWorktree(u64, Result<bool>),
 }
 
 pub struct Flash {
@@ -32,19 +35,35 @@ pub struct Flash {
     at: Instant,
 }
 
-/// Asks whether to reset a local branch that has diverged from its PR.
-pub struct ForceCheckoutPrompt {
-    pub number: u64,
-    pub branch: String,
+/// A yes/no question that captures input until it's answered.
+pub enum Prompt {
+    /// The PR's local branch has diverged from the PR, typically because the
+    /// PR was rebased or force-pushed.
+    ForceCheckout { number: u64, branch: String },
+    /// The PR's branch is checked out in the main checkout, so it can't also
+    /// have its own worktree.
+    MoveToWorktree {
+        number: u64,
+        branch: String,
+        main_path: String,
+    },
+    RemoveWorktree {
+        number: u64,
+        branch: String,
+        path: String,
+    },
 }
 
 pub struct App {
     pub repo: String,
+    pub default_branch: String,
     pub prs: Vec<PullRequest>,
+    /// Linked worktree paths by branch name.
+    pub worktrees: HashMap<String, String>,
     pub list: ListState,
     pub detail_scroll: u16,
     pub show_help: bool,
-    pub force_checkout_prompt: Option<ForceCheckoutPrompt>,
+    pub prompt: Option<Prompt>,
     /// When the in-flight fetch started, if one is running.
     pub loading_since: Option<Instant>,
     pub last_success: Option<Instant>,
@@ -56,7 +75,7 @@ pub struct App {
     tx: Sender<Msg>,
 }
 
-pub fn run(terminal: &mut DefaultTerminal, repo: String) -> Result<()> {
+pub fn run(terminal: &mut DefaultTerminal, repo: Repo) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let mut app = App::new(repo, tx);
     app.refresh();
@@ -77,14 +96,16 @@ pub fn run(terminal: &mut DefaultTerminal, repo: String) -> Result<()> {
 }
 
 impl App {
-    fn new(repo: String, tx: Sender<Msg>) -> Self {
+    fn new(repo: Repo, tx: Sender<Msg>) -> Self {
         App {
-            repo,
+            repo: repo.name,
+            default_branch: repo.default_branch,
             prs: Vec::new(),
+            worktrees: HashMap::new(),
             list: ListState::default(),
             detail_scroll: 0,
             show_help: false,
-            force_checkout_prompt: None,
+            prompt: None,
             loading_since: None,
             last_success: None,
             last_attempt: None,
@@ -97,6 +118,10 @@ impl App {
 
     pub fn selected_pr(&self) -> Option<&PullRequest> {
         self.list.selected().and_then(|i| self.prs.get(i))
+    }
+
+    pub fn worktree_for(&self, pr: &PullRequest) -> Option<&str> {
+        self.worktrees.get(&pr.head).map(String::as_str)
     }
 
     pub fn flash(&self) -> Option<&Flash> {
@@ -129,7 +154,17 @@ impl App {
         }
         self.loading_since = Some(Instant::now());
         let repo = self.repo.clone();
-        self.spawn(move || Msg::Prs(github::fetch_my_prs(&repo)));
+        self.spawn(move || {
+            let prs = github::fetch_my_prs(&repo);
+            // Worktrees are local and optional; failing to list them only
+            // hides the worktree marker.
+            let worktrees = worktree::list_worktrees().unwrap_or_default();
+            Msg::Prs(prs, worktrees)
+        });
+    }
+
+    fn refresh_worktrees(&self) {
+        self.spawn(|| Msg::Worktrees(worktree::list_worktrees()));
     }
 
     fn refresh_due(&self) -> bool {
@@ -147,9 +182,10 @@ impl App {
 
     fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Prs(result) => {
+            Msg::Prs(result, worktrees) => {
                 self.loading_since = None;
                 self.last_attempt = Some(Instant::now());
+                self.worktrees = worktrees;
                 match result {
                     Ok(prs) => self.set_prs(prs),
                     Err(err) => {
@@ -161,6 +197,8 @@ impl App {
                     }
                 }
             }
+            Msg::Worktrees(Ok(worktrees)) => self.worktrees = worktrees,
+            Msg::Worktrees(Err(_)) => {}
             Msg::CheckedOut(number, Ok(Checkout::Done(output))) => {
                 let text = match output.is_empty() {
                     true => format!("Checked out #{number}"),
@@ -170,14 +208,34 @@ impl App {
             }
             Msg::CheckedOut(number, Ok(Checkout::Diverged { branch })) => {
                 self.flash = None;
-                self.force_checkout_prompt = Some(ForceCheckoutPrompt { number, branch });
+                self.prompt = Some(Prompt::ForceCheckout { number, branch });
             }
-            Msg::OpenedWorktree(number, Ok(opened)) => {
+            Msg::OpenedWorktree(number, Ok(OpenOutcome::Opened(opened))) => {
                 self.set_flash(opened.summary(number), false);
+                self.refresh_worktrees();
+            }
+            Msg::OpenedWorktree(number, Ok(OpenOutcome::InMainCheckout { branch, path })) => {
+                self.flash = None;
+                self.prompt = Some(Prompt::MoveToWorktree {
+                    number,
+                    branch,
+                    main_path: path,
+                });
+            }
+            Msg::RemovedWorktree(number, Ok(closed_workspace)) => {
+                let text = match closed_workspace {
+                    true => format!(
+                        "Removed the worktree for PR #{number} and closed its Herdr workspace"
+                    ),
+                    false => format!("Removed the worktree for PR #{number}"),
+                };
+                self.set_flash(text, false);
+                self.refresh_worktrees();
             }
             Msg::CheckedOut(_, Err(err))
             | Msg::Opened(Err(err))
-            | Msg::OpenedWorktree(_, Err(err)) => {
+            | Msg::OpenedWorktree(_, Err(err))
+            | Msg::RemovedWorktree(_, Err(err)) => {
                 self.set_flash(format!("{err:#}"), true);
             }
             Msg::Opened(Ok(())) => {}
@@ -216,8 +274,8 @@ impl App {
             self.should_quit = true;
             return;
         }
-        if let Some(prompt) = self.force_checkout_prompt.take() {
-            self.on_force_checkout_key(key, prompt);
+        if let Some(prompt) = self.prompt.take() {
+            self.on_prompt_key(key, prompt);
             return;
         }
         if self.show_help {
@@ -259,14 +317,48 @@ impl App {
                     });
                 }
             }
+            KeyCode::Char('W') => {
+                if let Some(pr) = self.selected_pr() {
+                    let (number, branch) = (pr.number, pr.head.clone());
+                    match self.worktree_for(pr).map(str::to_owned) {
+                        Some(path) => {
+                            self.prompt = Some(Prompt::RemoveWorktree {
+                                number,
+                                branch,
+                                path,
+                            })
+                        }
+                        None => self.set_flash(format!("PR #{number} has no worktree"), false),
+                    }
+                }
+            }
             _ => {}
         }
     }
 
-    fn on_force_checkout_key(&mut self, key: KeyEvent, prompt: ForceCheckoutPrompt) {
+    fn on_prompt_key(&mut self, key: KeyEvent, prompt: Prompt) {
         match key.code {
-            KeyCode::Char('y') => {
-                let (repo, number, branch) = (self.repo.clone(), prompt.number, prompt.branch);
+            KeyCode::Char('y') => self.accept(prompt),
+            KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => {
+                let text = match prompt {
+                    Prompt::ForceCheckout { branch, .. } => format!("Kept local branch {branch}"),
+                    Prompt::MoveToWorktree { number, .. } => {
+                        format!("Left PR #{number} in the main checkout")
+                    }
+                    Prompt::RemoveWorktree { number, .. } => {
+                        format!("Kept the worktree for PR #{number}")
+                    }
+                };
+                self.set_flash(text, false);
+            }
+            _ => self.prompt = Some(prompt),
+        }
+    }
+
+    fn accept(&mut self, prompt: Prompt) {
+        match prompt {
+            Prompt::ForceCheckout { number, branch } => {
+                let repo = self.repo.clone();
                 self.set_flash(format!("Resetting {branch} to PR #{number}…"), false);
                 self.spawn(move || {
                     let result = github::force_checkout(&repo, number)
@@ -274,10 +366,30 @@ impl App {
                     Msg::CheckedOut(number, result)
                 });
             }
-            KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => {
-                self.set_flash(format!("Kept local branch {}", prompt.branch), false);
+            Prompt::MoveToWorktree {
+                number,
+                branch,
+                main_path,
+            } => {
+                let default_branch = self.default_branch.clone();
+                self.set_flash(
+                    format!("Switching the main checkout to {default_branch}…"),
+                    false,
+                );
+                self.spawn(move || {
+                    let result =
+                        worktree::move_to_worktree(number, &branch, &main_path, &default_branch);
+                    Msg::OpenedWorktree(number, result)
+                });
             }
-            _ => self.force_checkout_prompt = Some(prompt),
+            Prompt::RemoveWorktree {
+                number,
+                branch,
+                path,
+            } => {
+                self.set_flash(format!("Removing the worktree for PR #{number}…"), false);
+                self.spawn(move || Msg::RemovedWorktree(number, worktree::remove(&branch, &path)));
+            }
         }
     }
 }
@@ -314,9 +426,17 @@ pub(crate) mod tests {
 
     pub fn app_with(prs: Vec<PullRequest>) -> App {
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::new("o/r".into(), tx);
+        let repo = Repo {
+            name: "o/r".into(),
+            default_branch: "main".into(),
+        };
+        let mut app = App::new(repo, tx);
         app.set_prs(prs);
         app
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.on_key(KeyEvent::from(KeyCode::Char(c)));
     }
 
     #[test]
@@ -354,17 +474,17 @@ pub(crate) mod tests {
     #[test]
     fn navigation_is_bounded() {
         let mut app = app_with(vec![sample_pr(1, "a"), sample_pr(2, "b")]);
-        let press = |c| KeyEvent::from(KeyCode::Char(c));
-        app.on_key(press('k'));
+        press(&mut app, 'k');
         assert_eq!(app.list.selected(), Some(0));
-        app.on_key(press('G'));
-        app.on_key(press('j'));
+        press(&mut app, 'G');
+        press(&mut app, 'j');
         assert_eq!(app.list.selected(), Some(1));
-        app.on_key(press('g'));
+        press(&mut app, 'g');
         assert_eq!(app.list.selected(), Some(0));
     }
 
-    /// Only the decline path is tested: accepting spawns a real `gh` command.
+    // Prompt tests only decline: accepting spawns real git, gh and wt commands.
+
     #[test]
     fn diverged_checkout_prompts_until_answered() {
         let mut app = app_with(vec![sample_pr(1, "a"), sample_pr(2, "b")]);
@@ -372,17 +492,64 @@ pub(crate) mod tests {
             branch: "feature".into(),
         };
         app.on_msg(Msg::CheckedOut(2, Ok(diverged)));
-        assert_eq!(app.force_checkout_prompt.as_ref().unwrap().number, 2);
+        assert!(matches!(
+            app.prompt,
+            Some(Prompt::ForceCheckout { number: 2, .. })
+        ));
 
         // Other keys are swallowed while the prompt is open.
-        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        press(&mut app, 'j');
         assert_eq!(app.list.selected(), Some(0));
-        assert!(app.force_checkout_prompt.is_some());
+        assert!(app.prompt.is_some());
 
-        app.on_key(KeyEvent::from(KeyCode::Char('n')));
-        assert!(app.force_checkout_prompt.is_none());
+        press(&mut app, 'n');
+        assert!(app.prompt.is_none());
         assert!(!app.should_quit);
         assert_eq!(app.flash().unwrap().text, "Kept local branch feature");
+    }
+
+    #[test]
+    fn branch_in_main_checkout_prompts_to_move_it() {
+        let mut app = app_with(vec![sample_pr(3, "a")]);
+        let outcome = OpenOutcome::InMainCheckout {
+            branch: "feature".into(),
+            path: "/src/repo".into(),
+        };
+        app.on_msg(Msg::OpenedWorktree(3, Ok(outcome)));
+        assert!(matches!(
+            &app.prompt,
+            Some(Prompt::MoveToWorktree { number: 3, main_path, .. }) if main_path == "/src/repo"
+        ));
+        press(&mut app, 'n');
+        assert!(app.prompt.is_none());
+        assert_eq!(app.flash().unwrap().text, "Left PR #3 in the main checkout");
+    }
+
+    #[test]
+    fn remove_worktree_needs_a_worktree_and_confirmation() {
+        let mut app = app_with(vec![sample_pr(3, "a")]);
+        press(&mut app, 'W');
+        assert!(app.prompt.is_none());
+        assert_eq!(app.flash().unwrap().text, "PR #3 has no worktree");
+
+        app.worktrees
+            .insert("feature".into(), "/src/repo.feature".into());
+        press(&mut app, 'W');
+        assert!(matches!(
+            &app.prompt,
+            Some(Prompt::RemoveWorktree { number: 3, path, .. }) if path == "/src/repo.feature"
+        ));
+        press(&mut app, 'n');
+        assert!(app.prompt.is_none());
+        assert_eq!(app.flash().unwrap().text, "Kept the worktree for PR #3");
+    }
+
+    #[test]
+    fn refresh_updates_worktrees() {
+        let mut app = app_with(vec![sample_pr(3, "a")]);
+        let worktrees = HashMap::from([("feature".to_owned(), "/src/repo.feature".to_owned())]);
+        app.on_msg(Msg::Prs(Ok(vec![sample_pr(3, "a")]), worktrees));
+        assert_eq!(app.worktree_for(&app.prs[0]), Some("/src/repo.feature"));
     }
 
     #[test]

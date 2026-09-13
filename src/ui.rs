@@ -9,8 +9,9 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph, Wrap};
 
-use crate::app::{App, ForceCheckoutPrompt};
+use crate::app::{App, Prompt};
 use crate::model::{AutoMerge, Ci, CiState, Label, Merge, PullRequest, Review};
+use crate::worktree::tilde;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -25,40 +26,90 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_help {
         draw_help(frame);
     }
-    if let Some(prompt) = &app.force_checkout_prompt {
-        draw_force_checkout_prompt(frame, prompt);
+    if let Some(prompt) = &app.prompt {
+        draw_prompt(frame, prompt, &app.default_branch);
     }
 }
 
-fn draw_force_checkout_prompt(frame: &mut Frame, prompt: &ForceCheckoutPrompt) {
-    let lines = vec![
-        Line::from(vec![
-            "Local branch ".into(),
-            prompt.branch.as_str().bold(),
-            format!(" has diverged from PR #{}, ", prompt.number).into(),
-            "probably because the PR was rebased or force-pushed. ".into(),
-            "You are now on the local branch.".into(),
-        ]),
-        Line::default(),
-        Line::from(
-            "Reset it to match the PR? Commits that only exist on the local branch \
-             will be discarded (git reflog can still recover them).",
+fn draw_prompt(frame: &mut Frame, prompt: &Prompt, default_branch: &str) {
+    let (title, mut lines, yes, no) = match prompt {
+        Prompt::ForceCheckout { number, branch } => (
+            " Branch has diverged ",
+            vec![
+                Line::from(vec![
+                    "Local branch ".into(),
+                    branch.as_str().bold(),
+                    format!(" has diverged from PR #{number}, ").into(),
+                    "probably because the PR was rebased or force-pushed. ".into(),
+                    "You are now on the local branch.".into(),
+                ]),
+                Line::default(),
+                Line::from(
+                    "Reset it to match the PR? Commits that only exist on the local branch \
+                     will be discarded (git reflog can still recover them).",
+                ),
+            ],
+            "reset branch",
+            "keep local branch",
         ),
+        Prompt::MoveToWorktree {
+            number,
+            branch,
+            main_path,
+        } => (
+            " Branch is in your main checkout ",
+            vec![
+                Line::from(vec![
+                    format!("PR #{number}'s branch ").into(),
+                    branch.as_str().bold(),
+                    " is checked out in your main checkout ".into(),
+                    tilde(main_path).bold(),
+                    ", and git allows a branch in only one worktree.".into(),
+                ]),
+                Line::default(),
+                Line::from(vec![
+                    "Switch the main checkout back to ".into(),
+                    default_branch.bold(),
+                    " and open the PR in its own worktree?".into(),
+                ]),
+            ],
+            "move to worktree",
+            "leave it",
+        ),
+        Prompt::RemoveWorktree { number, path, .. } => (
+            " Remove worktree ",
+            vec![
+                Line::from(vec![
+                    format!("Remove the worktree for PR #{number} at ").into(),
+                    tilde(path).bold(),
+                    "? Its Herdr workspace, and anything running in it, is closed too.".into(),
+                ]),
+                Line::default(),
+                Line::from(
+                    "worktrunk refuses if the worktree has uncommitted changes. \
+                     The branch is kept unless it's merged.",
+                ),
+            ],
+            "remove",
+            "keep",
+        ),
+    };
+    lines.extend([
         Line::default(),
         Line::from(vec![
             " y ".bold().black().on_yellow(),
-            " reset branch    ".into(),
+            format!(" {yes}    ").into(),
             " n ".bold().reversed(),
-            " keep local branch".into(),
+            format!(" {no}").into(),
         ])
         .centered(),
-    ];
+    ]);
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
-    let width = 60.min(frame.area().width);
+    let width = 64.min(frame.area().width);
     let height = paragraph.line_count(width.saturating_sub(4)) as u16 + 2;
     let area = centered(frame.area(), width, height);
     let block = Block::bordered()
-        .title(" Branch has diverged ".bold())
+        .title(title.bold())
         .border_style(Style::new().yellow())
         .padding(Padding::horizontal(1));
     frame.render_widget(Clear, area);
@@ -90,6 +141,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|pr| pr.number.to_string().len())
         .max()
         .unwrap_or(1);
+    let worktrees = &app.worktrees;
     let items = app.prs.iter().map(|pr| {
         let mut title = vec![
             format!("#{:<number_width$} ", pr.number).dark_gray(),
@@ -98,7 +150,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         ];
         title.extend(label_chips(&pr.labels));
         let mut status = vec![Span::raw(" ".repeat(number_width + 2))];
-        for badge in status_badges(pr) {
+        for badge in status_badges(pr, worktrees.contains_key(&pr.head)) {
             status.extend([badge, Span::raw("  ")]);
         }
         status.pop();
@@ -114,7 +166,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
 /// Short colored status words for a list row. States with nothing to act on
 /// (ready, no conflicts, auto-merge off) are left out.
-fn status_badges(pr: &PullRequest) -> Vec<Span<'static>> {
+fn status_badges(pr: &PullRequest, has_worktree: bool) -> Vec<Span<'static>> {
     let badge = |glyph: Span<'static>, text: &str| {
         Span::styled(format!("{} {text}", glyph.content), glyph.style)
     };
@@ -158,6 +210,9 @@ fn status_badges(pr: &PullRequest) -> Vec<Span<'static>> {
         1 => badges.push("1 thread".yellow()),
         n => badges.push(format!("{n} threads").yellow()),
     }
+    if has_worktree {
+        badges.push(badge(worktree_glyph(), "worktree"));
+    }
     badges
 }
 
@@ -168,7 +223,8 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let inner_width = area.width.saturating_sub(2);
 
-    let header = Paragraph::new(header_lines(pr)).wrap(Wrap { trim: false });
+    let worktree = app.worktree_for(pr).map(tilde);
+    let header = Paragraph::new(header_lines(pr, worktree)).wrap(Wrap { trim: false });
     let header_height =
         (header.line_count(inner_width) as u16 + 2).min(area.height.saturating_sub(5));
     let [top, bottom] =
@@ -191,7 +247,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     app.detail_scroll = scroll;
 }
 
-fn header_lines(pr: &PullRequest) -> Vec<Line<'_>> {
+fn header_lines(pr: &PullRequest, worktree: Option<String>) -> Vec<Line<'_>> {
     let mut lines = vec![
         Line::from(pr.title.as_str().bold()),
         Line::from(format!("{} → {}", pr.head, pr.base).dark_gray()),
@@ -224,6 +280,9 @@ fn header_lines(pr: &PullRequest) -> Vec<Line<'_>> {
             format!("unresolved review {noun}"),
         ));
     }
+    if let Some(path) = worktree {
+        lines.push(status(worktree_glyph(), format!("Worktree at {path}")));
+    }
     lines
 }
 
@@ -249,16 +308,25 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Some(flash) if flash.is_error => Line::from(format!(" {}", flash.text).red()),
         Some(flash) => Line::from(format!(" {}", flash.text).green()),
         None => {
-            let keys = [
+            let mut keys = vec![
                 ("j/k", "move"),
                 ("o", "open"),
                 ("c", "checkout"),
                 ("w", "worktree"),
+            ];
+            // Only offer removal where there's something to remove.
+            if app
+                .selected_pr()
+                .is_some_and(|pr| app.worktree_for(pr).is_some())
+            {
+                keys.push(("W", "remove worktree"));
+            }
+            keys.extend([
                 ("r", "refresh"),
                 ("J/K", "scroll"),
                 ("?", "keys"),
                 ("q", "quit"),
-            ];
+            ]);
             let spans = keys.into_iter().flat_map(|(key, action)| {
                 [format!(" {key}").bold(), format!(" {action} ").dark_gray()]
             });
@@ -279,6 +347,7 @@ fn draw_help(frame: &mut Frame) {
         key("o  Enter", "open in browser"),
         key("c", "gh pr checkout"),
         key("w", "worktree (+ Herdr workspace)"),
+        key("W", "remove the PR's worktree"),
         key("r", "refresh now (auto every 60s)"),
         key("q  Esc", "quit"),
     ];
@@ -323,6 +392,10 @@ fn label_chips(labels: &[Label]) -> Vec<Span<'_>> {
     }
     spans.pop();
     spans
+}
+
+fn worktree_glyph() -> Span<'static> {
+    "⌂".blue()
 }
 
 fn draft_glyph(is_draft: bool) -> Span<'static> {
@@ -468,7 +541,7 @@ mod tests {
         pr.merge = Merge::Clean;
         pr.auto_merge = AutoMerge::Off;
         pr.unresolved_threads = 1;
-        let text: Vec<_> = status_badges(&pr)
+        let text: Vec<_> = status_badges(&pr, false)
             .iter()
             .map(|s| s.content.to_string())
             .collect();
@@ -484,7 +557,7 @@ mod tests {
         pr.merge = Merge::Behind;
         pr.auto_merge = AutoMerge::Queued { position: Some(2) };
         pr.unresolved_threads = 0;
-        let text: Vec<_> = status_badges(&pr)
+        let text: Vec<_> = status_badges(&pr, false)
             .iter()
             .map(|s| s.content.to_string())
             .collect();
@@ -503,7 +576,7 @@ mod tests {
     #[test]
     fn renders_force_checkout_prompt() {
         let mut app = app_with(vec![sample_pr(482, "Add retry logic")]);
-        app.force_checkout_prompt = Some(ForceCheckoutPrompt {
+        app.prompt = Some(Prompt::ForceCheckout {
             number: 482,
             branch: "feature/retry".into(),
         });
@@ -512,6 +585,52 @@ mod tests {
         assert!(screen.contains("feature/retry"), "{screen}");
         assert!(screen.contains(" y  reset branch"), "{screen}");
         assert!(screen.contains(" n  keep local branch"), "{screen}");
+    }
+
+    #[test]
+    fn renders_worktree_prompts() {
+        let mut app = app_with(vec![sample_pr(482, "Add retry logic")]);
+        app.prompt = Some(Prompt::MoveToWorktree {
+            number: 482,
+            branch: "feature".into(),
+            main_path: "/src/repo".into(),
+        });
+        let screen = render(&mut app);
+        assert!(
+            screen.contains("Branch is in your main checkout"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Switch the main checkout back to main"),
+            "{screen}"
+        );
+        assert!(screen.contains(" y  move to worktree"), "{screen}");
+
+        app.prompt = Some(Prompt::RemoveWorktree {
+            number: 482,
+            branch: "feature".into(),
+            path: "/src/repo.feature".into(),
+        });
+        let screen = render(&mut app);
+        assert!(screen.contains("Remove worktree"), "{screen}");
+        assert!(screen.contains("/src/repo.feature"), "{screen}");
+        assert!(screen.contains(" y  remove"), "{screen}");
+    }
+
+    #[test]
+    fn shows_worktree_in_list_and_detail() {
+        let mut app = app_with(vec![sample_pr(482, "Add retry logic")]);
+        assert!(!render(&mut app).contains("W remove worktree"));
+
+        app.worktrees
+            .insert("feature".into(), "/src/repo.feature".into());
+        let screen = render(&mut app);
+        assert!(screen.contains(" W remove worktree "), "{screen}");
+        assert!(screen.contains("12 threads  ⌂ worktree"), "{screen}");
+        assert!(
+            screen.contains("⌂ Worktree at /src/repo.feature"),
+            "{screen}"
+        );
     }
 
     #[test]

@@ -69,7 +69,7 @@ fn check(program: &str, args: &[&str], output: Output) -> Result<Output> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "`{program} {}` failed: {}",
-            args[..2].join(" "),
+            args[..args.len().min(2)].join(" "),
             stderr.trim()
         );
     }
@@ -81,7 +81,19 @@ fn gh(args: &[&str]) -> Result<Output> {
 }
 
 fn git(args: &[&str]) -> Result<String> {
-    let output = check("git", args, run("git", args)?)?;
+    git_in(".", args)
+}
+
+/// Runs git in `dir`, returning its trimmed stdout.
+pub fn git_in(dir: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run `git`; is it installed and on PATH?")?;
+    let output = check("git", args, output)?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
@@ -91,17 +103,31 @@ fn last_line(output: &Output) -> String {
     text.lines().last().unwrap_or_default().trim().to_owned()
 }
 
-/// Resolves the GitHub repository (`owner/name`) for the current directory.
-pub fn current_repo() -> Result<String> {
+pub struct Repo {
+    /// `owner/name`
+    pub name: String,
+    pub default_branch: String,
+}
+
+/// Resolves the GitHub repository for the current directory.
+pub fn current_repo() -> Result<Repo> {
     let output = gh(&[
         "repo",
         "view",
         "--json",
-        "nameWithOwner",
+        "nameWithOwner,defaultBranchRef",
         "--jq",
-        ".nameWithOwner",
+        ".nameWithOwner + \" \" + .defaultBranchRef.name",
     ])?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (name, default_branch) = text
+        .trim()
+        .split_once(' ')
+        .context("unexpected output from `gh repo view`")?;
+    Ok(Repo {
+        name: name.to_owned(),
+        default_branch: default_branch.to_owned(),
+    })
 }
 
 /// Fetches the open pull requests authored by the authenticated user.
