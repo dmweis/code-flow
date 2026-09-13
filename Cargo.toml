@@ -1,6 +1,8 @@
 [package]
 name = "pr-triage"
 version = "0.1.0"
+authors = ["David Weis <dweis7@gmail.com>"]
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
