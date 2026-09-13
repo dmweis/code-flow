@@ -15,18 +15,21 @@ cargo install --path .
 
 Then run `pr-triage` from inside a clone of a GitHub repository.
 
-## Status columns
+## Statuses
 
-| Column | Meaning |
+Each PR takes two lines: its number, title and labels, then short status
+words. Only states worth acting on are shown:
+
+| Status | Words |
 | --- | --- |
-| D | `●` ready, `◌` draft |
-| R | `◷` needs review, `✓` approved, `✗` changes requested |
-| CI | `⟳` running, `✓` passed, `✗` failed, `·` no checks |
-| M | `✓` no conflicts, `⚠` conflicts, `↓` behind base, `?` unknown |
-| A | `»` auto-merge enabled, `≡` in merge queue |
-| T | number of unresolved review threads |
+| Draft | `◌ draft` (replaces "needs review" until someone reviews) |
+| Review | `◷ needs review`, `✓ approved`, `✗ changes requested` |
+| CI | `⟳ CI 3/7` (running, done/total), `✓ CI passed`, `✗ CI 2 failed`, `· no CI` |
+| Merge | `⚠ conflicts`, `↓ behind base` |
+| Auto-merge | `» auto-merge`, `≡ queued #2` |
+| Threads | `2 threads` unresolved review threads |
 
-Labels are shown after the title. Press `?` in the app for the legend and key bindings.
+The detail pane on the right spells out every status in full and shows the PR description.
 
 ## Keys
 
@@ -38,7 +41,7 @@ Labels are shown after the title. Press `?` in the app for the legend and key bi
 | `o`, `Enter` | open PR in browser |
 | `c` | `gh pr checkout` the selected PR |
 | `r` | refresh (also automatic every 60s) |
-| `?` | legend |
+| `?` | key bindings |
 | `q`, `Esc` | quit |
 
 ## License

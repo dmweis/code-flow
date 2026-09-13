@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::widgets::TableState;
+use ratatui::widgets::ListState;
 
 use crate::github;
 use crate::model::PullRequest;
@@ -33,7 +33,7 @@ pub struct Flash {
 pub struct App {
     pub repo: String,
     pub prs: Vec<PullRequest>,
-    pub table: TableState,
+    pub list: ListState,
     pub detail_scroll: u16,
     pub show_help: bool,
     /// When the in-flight fetch started, if one is running.
@@ -72,7 +72,7 @@ impl App {
         App {
             repo,
             prs: Vec::new(),
-            table: TableState::default(),
+            list: ListState::default(),
             detail_scroll: 0,
             show_help: false,
             loading_since: None,
@@ -86,7 +86,7 @@ impl App {
     }
 
     pub fn selected_pr(&self) -> Option<&PullRequest> {
-        self.table.selected().and_then(|i| self.prs.get(i))
+        self.list.selected().and_then(|i| self.prs.get(i))
     }
 
     pub fn flash(&self) -> Option<&Flash> {
@@ -166,14 +166,14 @@ impl App {
     /// Replaces the PR list, keeping the same PR selected if it's still open.
     fn set_prs(&mut self, prs: Vec<PullRequest>) {
         let previous = self.selected_pr().map(|pr| pr.number);
-        let old_index = self.table.selected().unwrap_or(0);
+        let old_index = self.list.selected().unwrap_or(0);
         self.prs = prs;
         self.load_error = None;
         self.last_success = Some(Instant::now());
         let index = previous
             .and_then(|number| self.prs.iter().position(|pr| pr.number == number))
             .or_else(|| (!self.prs.is_empty()).then(|| old_index.min(self.prs.len() - 1)));
-        self.table.select(index);
+        self.list.select(index);
         if self.selected_pr().map(|pr| pr.number) != previous {
             self.detail_scroll = 0;
         }
@@ -184,8 +184,8 @@ impl App {
             return;
         }
         let index = index.min(self.prs.len() - 1);
-        if self.table.selected() != Some(index) {
-            self.table.select(Some(index));
+        if self.list.selected() != Some(index) {
+            self.list.select(Some(index));
             self.detail_scroll = 0;
         }
     }
@@ -195,7 +195,7 @@ impl App {
             self.show_help = false;
             return;
         }
-        let current = self.table.selected().unwrap_or(0);
+        let current = self.list.selected().unwrap_or(0);
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
@@ -303,11 +303,11 @@ pub(crate) mod tests {
         let mut app = app_with(vec![sample_pr(1, "a"), sample_pr(2, "b")]);
         let press = |c| KeyEvent::from(KeyCode::Char(c));
         app.on_key(press('k'));
-        assert_eq!(app.table.selected(), Some(0));
+        assert_eq!(app.list.selected(), Some(0));
         app.on_key(press('G'));
         app.on_key(press('j'));
-        assert_eq!(app.table.selected(), Some(1));
+        assert_eq!(app.list.selected(), Some(1));
         app.on_key(press('g'));
-        assert_eq!(app.table.selected(), Some(0));
+        assert_eq!(app.list.selected(), Some(0));
     }
 }

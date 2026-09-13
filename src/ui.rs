@@ -1,5 +1,5 @@
-//! Rendering. Every status has a glyph (used in the list) and a description
-//! (used in the detail pane), so the detail pane doubles as a legend.
+//! Rendering. Every status has a colored glyph, shown with a short word in
+//! the list and a full description in the detail pane.
 
 use std::time::Duration;
 
@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap};
 
 use crate::app::App;
 use crate::model::{AutoMerge, Ci, CiState, Label, Merge, PullRequest, Review};
@@ -51,54 +51,76 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|pr| pr.number.to_string().len())
         .max()
-        .unwrap_or(1) as u16;
-    let header = Row::new([
-        Cell::from(Line::from("#").right_aligned()),
-        "D".into(),
-        "R".into(),
-        "CI".into(),
-        "M".into(),
-        "A".into(),
-        "T".into(),
-        "Title".into(),
-    ])
-    .style(Style::new().dark_gray().bold());
-    let rows = app.prs.iter().map(|pr| {
-        let threads = match pr.unresolved_threads {
-            0 => Span::raw(""),
-            n @ 1..=9 => n.to_string().yellow(),
-            _ => "9+".yellow(),
-        };
-        let mut title = vec![Span::raw(pr.title.as_str()), Span::raw(" ")];
+        .unwrap_or(1);
+    let items = app.prs.iter().map(|pr| {
+        let mut title = vec![
+            format!("#{:<number_width$} ", pr.number).dark_gray(),
+            Span::raw(pr.title.as_str()),
+            Span::raw(" "),
+        ];
         title.extend(label_chips(&pr.labels));
-        Row::new([
-            Cell::from(Line::from(pr.number.to_string()).right_aligned()),
-            draft_glyph(pr.is_draft).into(),
-            review_glyph(pr.review).into(),
-            ci_glyph(pr.ci).into(),
-            merge_glyph(pr.merge).into(),
-            auto_merge_glyph(pr.auto_merge).into(),
-            threads.into(),
-            Line::from(title).into(),
-        ])
+        let mut status = vec![Span::raw(" ".repeat(number_width + 2))];
+        for badge in status_badges(pr) {
+            status.extend([badge, Span::raw("  ")]);
+        }
+        status.pop();
+        ListItem::new(vec![Line::from(title), Line::from(status)])
     });
-    let widths = [
-        Constraint::Length(number_width),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(2),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(2),
-        Constraint::Fill(1),
-    ];
-    let table = Table::new(rows, widths)
-        .header(header)
+    let list = List::new(items)
         .block(block)
-        .row_highlight_style(Style::new().bg(Color::Indexed(237)).bold())
+        .highlight_style(Style::new().bg(Color::Indexed(237)).bold())
         .highlight_symbol("▶ ")
         .highlight_spacing(HighlightSpacing::Always);
-    frame.render_stateful_widget(table, area, &mut app.table);
+    frame.render_stateful_widget(list, area, &mut app.list);
+}
+
+/// Short colored status words for a list row. States with nothing to act on
+/// (ready, no conflicts, auto-merge off) are left out.
+fn status_badges(pr: &PullRequest) -> Vec<Span<'static>> {
+    let badge = |glyph: Span<'static>, text: &str| {
+        Span::styled(format!("{} {text}", glyph.content), glyph.style)
+    };
+    let mut badges = Vec::new();
+    if pr.is_draft {
+        badges.push(badge(draft_glyph(true), "draft"));
+    }
+    // A draft isn't asking for review yet, so only show a verdict if there is one.
+    if !(pr.is_draft && pr.review == Review::Required) {
+        let text = match pr.review {
+            Review::Required => "needs review",
+            Review::Approved => "approved",
+            Review::ChangesRequested => "changes requested",
+        };
+        badges.push(badge(review_glyph(pr.review), text));
+    }
+    let ci = match pr.ci.state {
+        CiState::None => "no CI".to_owned(),
+        CiState::Running => format!("CI {}/{}", pr.ci.total - pr.ci.pending, pr.ci.total),
+        CiState::Passed => "CI passed".to_owned(),
+        CiState::Failed if pr.ci.failed == 0 => "CI failed".to_owned(),
+        CiState::Failed => format!("CI {} failed", pr.ci.failed),
+    };
+    badges.push(badge(ci_glyph(pr.ci), &ci));
+    match pr.merge {
+        Merge::Conflicts => badges.push(badge(merge_glyph(pr.merge), "conflicts")),
+        Merge::Behind => badges.push(badge(merge_glyph(pr.merge), "behind base")),
+        Merge::Clean | Merge::Unknown => {}
+    }
+    let glyph = auto_merge_glyph(pr.auto_merge);
+    match pr.auto_merge {
+        AutoMerge::Off => {}
+        AutoMerge::Enabled => badges.push(badge(glyph, "auto-merge")),
+        AutoMerge::Queued { position: Some(p) } => {
+            badges.push(badge(glyph, &format!("queued #{p}")))
+        }
+        AutoMerge::Queued { position: None } => badges.push(badge(glyph, "queued")),
+    }
+    match pr.unresolved_threads {
+        0 => {}
+        1 => badges.push("1 thread".yellow()),
+        n => badges.push(format!("{n} threads").yellow()),
+    }
+    badges
 }
 
 fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -195,7 +217,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 ("c", "checkout"),
                 ("r", "refresh"),
                 ("J/K", "scroll"),
-                ("?", "legend"),
+                ("?", "keys"),
                 ("q", "quit"),
             ];
             let spans = keys.into_iter().flat_map(|(key, action)| {
@@ -208,74 +230,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help(frame: &mut Frame) {
-    let row = |label: &'static str, glyphs: Vec<Span<'static>>| {
-        let mut spans = vec![format!(" {label:<3} ").bold()];
-        spans.extend(glyphs);
-        Line::from(spans)
-    };
     let key = |keys: &'static str, action: &'static str| {
         Line::from(vec![format!(" {keys:<14}").bold(), action.into()])
     };
     let lines = vec![
-        Line::from(" Columns".dark_gray()),
-        row(
-            "D",
-            vec![
-                draft_glyph(false),
-                " ready  ".into(),
-                draft_glyph(true),
-                " draft".into(),
-            ],
-        ),
-        row(
-            "R",
-            vec![
-                review_glyph(Review::Required),
-                " needs review  ".into(),
-                review_glyph(Review::Approved),
-                " approved  ".into(),
-                review_glyph(Review::ChangesRequested),
-                " changes requested".into(),
-            ],
-        ),
-        row(
-            "CI",
-            vec![
-                "⟳".yellow(),
-                " running  ".into(),
-                "✓".green(),
-                " passed  ".into(),
-                "✗".red(),
-                " failed  ".into(),
-                "·".dark_gray(),
-                " no checks".into(),
-            ],
-        ),
-        row(
-            "M",
-            vec![
-                merge_glyph(Merge::Clean),
-                " no conflicts  ".into(),
-                merge_glyph(Merge::Conflicts),
-                " conflicts  ".into(),
-                merge_glyph(Merge::Behind),
-                " behind base  ".into(),
-                merge_glyph(Merge::Unknown),
-                " unknown".into(),
-            ],
-        ),
-        row(
-            "A",
-            vec![
-                auto_merge_glyph(AutoMerge::Enabled),
-                " auto-merge on  ".into(),
-                auto_merge_glyph(AutoMerge::Queued { position: None }),
-                " in merge queue".into(),
-            ],
-        ),
-        row("T", vec!["2".yellow(), " unresolved review threads".into()]),
-        Line::default(),
-        Line::from(" Keys".dark_gray()),
         key("j/k  ↑/↓", "move selection"),
         key("g/G", "first / last"),
         key("J/K  PgUp/Dn", "scroll description"),
@@ -287,7 +245,7 @@ fn draw_help(frame: &mut Frame) {
     let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 3;
     let height = lines.len() as u16 + 2;
     let area = centered(frame.area(), width, height);
-    let popup = Paragraph::new(lines).block(Block::bordered().title(" Legend ".bold()));
+    let popup = Paragraph::new(lines).block(Block::bordered().title(" Keys ".bold()));
     frame.render_widget(Clear, area);
     frame.render_widget(popup, area);
 }
@@ -373,15 +331,16 @@ fn ci_text(ci: Ci) -> String {
         failed,
         ..
     } = ci;
+    let checks = if total == 1 { "check" } else { "checks" };
     match ci.state {
         CiState::None => "No CI checks".into(),
         CiState::Running => format!("CI running ({}/{total} done)", total - pending),
-        CiState::Passed => format!("CI passed ({total} checks)"),
+        CiState::Passed => format!("CI passed ({total} {checks})"),
         CiState::Failed if failed == 0 => "CI failed".into(),
         CiState::Failed if pending > 0 => {
             format!("CI failed ({failed} failed, {pending} still running)")
         }
-        CiState::Failed => format!("CI failed ({failed} of {total} checks)"),
+        CiState::Failed => format!("CI failed ({failed} of {total} {checks})"),
     }
 }
 
@@ -429,7 +388,7 @@ mod tests {
     use crate::app::tests::{app_with, sample_pr};
 
     fn render(app: &mut App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(150, 24)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer();
         buffer
@@ -445,13 +404,60 @@ mod tests {
         let mut app = app_with(vec![sample_pr(482, "Add retry logic")]);
         let screen = render(&mut app);
         assert!(screen.contains("My PRs · o/r (1)"), "{screen}");
+        assert!(screen.contains("▶ #482 Add retry logic  bug "), "{screen}");
         assert!(
-            screen.contains("▶ 482 ● ✓ ⟳  ⚠ » 9+ Add retry logic  bug "),
+            screen.contains("│       ✓ approved  ⟳ CI 3/7  ⚠ conflicts  » auto-merge  12 threads"),
             "{screen}"
         );
         assert!(screen.contains("CI running (3/7 done)"), "{screen}");
         assert!(screen.contains("12 unresolved review threads"), "{screen}");
         assert!(screen.contains("Body text"), "{screen}");
+    }
+
+    #[test]
+    fn draft_replaces_needs_review_in_list() {
+        let mut pr = sample_pr(7, "Draft");
+        pr.is_draft = true;
+        pr.review = Review::Required;
+        pr.ci = Ci {
+            state: CiState::None,
+            total: 0,
+            pending: 0,
+            failed: 0,
+        };
+        pr.merge = Merge::Clean;
+        pr.auto_merge = AutoMerge::Off;
+        pr.unresolved_threads = 1;
+        let text: Vec<_> = status_badges(&pr)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(text, ["◌ draft", "· no CI", "1 thread"]);
+
+        pr.review = Review::ChangesRequested;
+        pr.ci = Ci {
+            state: CiState::Failed,
+            total: 5,
+            pending: 2,
+            failed: 1,
+        };
+        pr.merge = Merge::Behind;
+        pr.auto_merge = AutoMerge::Queued { position: Some(2) };
+        pr.unresolved_threads = 0;
+        let text: Vec<_> = status_badges(&pr)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "◌ draft",
+                "✗ changes requested",
+                "✗ CI 1 failed",
+                "↓ behind base",
+                "≡ queued #2"
+            ]
+        );
     }
 
     #[test]
