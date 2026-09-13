@@ -2,6 +2,7 @@ mod app;
 mod github;
 mod model;
 mod ui;
+mod worktree;
 
 use anyhow::Result;
 

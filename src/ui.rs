@@ -253,6 +253,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 ("j/k", "move"),
                 ("o", "open"),
                 ("c", "checkout"),
+                ("w", "worktree"),
                 ("r", "refresh"),
                 ("J/K", "scroll"),
                 ("?", "keys"),
@@ -277,6 +278,7 @@ fn draw_help(frame: &mut Frame) {
         key("J/K  PgUp/Dn", "scroll description"),
         key("o  Enter", "open in browser"),
         key("c", "gh pr checkout"),
+        key("w", "worktree (+ Herdr workspace)"),
         key("r", "refresh now (auto every 60s)"),
         key("q  Esc", "quit"),
     ];

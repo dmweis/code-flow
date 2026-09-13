@@ -40,6 +40,7 @@ The detail pane on the right spells out every status in full and shows the PR de
 | `J`/`K`, `PgUp`/`PgDn` | scroll description |
 | `o`, `Enter` | open PR in browser |
 | `c` | `gh pr checkout` the selected PR; if your local branch has diverged (e.g. the PR was rebased), offers to reset it |
+| `w` | open the PR in a [worktrunk](https://worktrunk.dev) worktree and, inside [Herdr](https://herdr.dev), a Herdr workspace there (both optional) |
 | `r` | refresh (also automatic every 60s) |
 | `?` | key bindings |
 | `q`, `Esc` | quit |

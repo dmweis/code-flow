@@ -12,6 +12,7 @@ use ratatui::widgets::ListState;
 use crate::github::{self, Checkout};
 use crate::model::PullRequest;
 use crate::ui;
+use crate::worktree::{self, OpenedWorktree};
 
 const TICK: Duration = Duration::from_millis(200);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -22,6 +23,7 @@ enum Msg {
     Prs(Result<Vec<PullRequest>>),
     CheckedOut(u64, Result<Checkout>),
     Opened(Result<()>),
+    OpenedWorktree(u64, Result<OpenedWorktree>),
 }
 
 pub struct Flash {
@@ -170,7 +172,12 @@ impl App {
                 self.flash = None;
                 self.force_checkout_prompt = Some(ForceCheckoutPrompt { number, branch });
             }
-            Msg::CheckedOut(_, Err(err)) | Msg::Opened(Err(err)) => {
+            Msg::OpenedWorktree(number, Ok(opened)) => {
+                self.set_flash(opened.summary(number), false);
+            }
+            Msg::CheckedOut(_, Err(err))
+            | Msg::Opened(Err(err))
+            | Msg::OpenedWorktree(_, Err(err)) => {
                 self.set_flash(format!("{err:#}"), true);
             }
             Msg::Opened(Ok(())) => {}
@@ -241,6 +248,15 @@ impl App {
                     let (repo, number) = (self.repo.clone(), pr.number);
                     self.set_flash(format!("Checking out #{number}…"), false);
                     self.spawn(move || Msg::CheckedOut(number, github::checkout(&repo, number)));
+                }
+            }
+            KeyCode::Char('w') => {
+                if let Some(pr) = self.selected_pr() {
+                    let (number, branch) = (pr.number, pr.head.clone());
+                    self.set_flash(format!("Opening PR #{number} in a worktree…"), false);
+                    self.spawn(move || {
+                        Msg::OpenedWorktree(number, worktree::open_pr(number, &branch))
+                    });
                 }
             }
             _ => {}
