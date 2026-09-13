@@ -1,0 +1,534 @@
+//! Talks to GitHub through the `gh` CLI so we reuse its authentication.
+
+use std::process::{Command, Stdio};
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+
+use crate::model::{AutoMerge, Ci, CiState, Label, Merge, PullRequest, Review};
+
+const QUERY: &str = r#"
+query($q: String!) {
+  search(query: $q, type: ISSUE, first: 100) {
+    nodes {
+      ... on PullRequest {
+        number title body isDraft headRefName baseRefName
+        reviewDecision mergeable mergeStateStatus
+        isInMergeQueue mergeQueueEntry { position }
+        autoMergeRequest { enabledAt }
+        labels(first: 20) { nodes { name color } }
+        latestReviews(first: 50) { nodes { state } }
+        reviewThreads(first: 100) { nodes { isResolved } }
+        commits(last: 1) { nodes { commit { statusCheckRollup {
+          state
+          contexts(first: 0) {
+            totalCount
+            checkRunCountsByState { state count }
+            statusContextCountsByState { state count }
+          }
+        } } } }
+      }
+    }
+  }
+}
+"#;
+
+/// Check run and status context states that mean "not finished yet".
+const PENDING_STATES: &[&str] = &[
+    "QUEUED",
+    "IN_PROGRESS",
+    "PENDING",
+    "WAITING",
+    "REQUESTED",
+    "EXPECTED",
+];
+
+/// Check run and status context states that mean "this check failed".
+const FAILED_STATES: &[&str] = &[
+    "FAILURE",
+    "ERROR",
+    "TIMED_OUT",
+    "STARTUP_FAILURE",
+    "CANCELLED",
+    "ACTION_REQUIRED",
+];
+
+fn gh(args: &[&str]) -> Result<std::process::Output> {
+    let output = Command::new("gh")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run `gh`; is the GitHub CLI installed and on PATH?")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("`gh {}` failed: {}", args[..2].join(" "), stderr.trim());
+    }
+    Ok(output)
+}
+
+/// Resolves the GitHub repository (`owner/name`) for the current directory.
+pub fn current_repo() -> Result<String> {
+    let output = gh(&[
+        "repo",
+        "view",
+        "--json",
+        "nameWithOwner",
+        "--jq",
+        ".nameWithOwner",
+    ])?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Fetches the open pull requests authored by the authenticated user.
+pub fn fetch_my_prs(repo: &str) -> Result<Vec<PullRequest>> {
+    let search = format!("repo:{repo} is:pr is:open author:@me sort:updated-desc");
+    let output = gh(&[
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={QUERY}"),
+        "-f",
+        &format!("q={search}"),
+    ])?;
+    parse_response(&output.stdout)
+}
+
+pub fn checkout(repo: &str, number: u64) -> Result<String> {
+    let output = gh(&["pr", "checkout", &number.to_string(), "--repo", repo])?;
+    // git reports the branch switch on stderr.
+    let text = String::from_utf8_lossy(&output.stderr);
+    Ok(text.lines().last().unwrap_or_default().trim().to_owned())
+}
+
+pub fn open_in_browser(repo: &str, number: u64) -> Result<()> {
+    gh(&["pr", "view", &number.to_string(), "--repo", repo, "--web"])?;
+    Ok(())
+}
+
+fn parse_response(json: &[u8]) -> Result<Vec<PullRequest>> {
+    let response: Response =
+        serde_json::from_slice(json).context("unexpected response from GitHub")?;
+    Ok(response
+        .data
+        .search
+        .nodes
+        .into_iter()
+        .map(PullRequest::from)
+        .collect())
+}
+
+#[derive(Deserialize)]
+struct Response {
+    data: Data,
+}
+
+#[derive(Deserialize)]
+struct Data {
+    search: Nodes<RawPr>,
+}
+
+#[derive(Deserialize)]
+struct Nodes<T> {
+    nodes: Vec<T>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPr {
+    number: u64,
+    title: String,
+    body: String,
+    is_draft: bool,
+    head_ref_name: String,
+    base_ref_name: String,
+    review_decision: Option<String>,
+    mergeable: String,
+    merge_state_status: String,
+    is_in_merge_queue: bool,
+    merge_queue_entry: Option<QueueEntry>,
+    auto_merge_request: Option<serde_json::Value>,
+    labels: Nodes<RawLabel>,
+    latest_reviews: Nodes<RawReview>,
+    review_threads: Nodes<RawThread>,
+    commits: Nodes<RawCommitNode>,
+}
+
+#[derive(Deserialize)]
+struct QueueEntry {
+    position: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct RawLabel {
+    name: String,
+    color: String,
+}
+
+#[derive(Deserialize)]
+struct RawReview {
+    state: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawThread {
+    is_resolved: bool,
+}
+
+#[derive(Deserialize)]
+struct RawCommitNode {
+    commit: RawCommit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawCommit {
+    status_check_rollup: Option<RawRollup>,
+}
+
+#[derive(Deserialize)]
+struct RawRollup {
+    state: String,
+    contexts: RawContexts,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawContexts {
+    total_count: u32,
+    check_run_counts_by_state: Option<Vec<RawCount>>,
+    status_context_counts_by_state: Option<Vec<RawCount>>,
+}
+
+#[derive(Deserialize)]
+struct RawCount {
+    state: String,
+    count: u32,
+}
+
+impl From<RawPr> for PullRequest {
+    fn from(raw: RawPr) -> Self {
+        let rollup = raw
+            .commits
+            .nodes
+            .into_iter()
+            .next()
+            .and_then(|node| node.commit.status_check_rollup);
+        PullRequest {
+            number: raw.number,
+            review: review_status(raw.review_decision.as_deref(), &raw.latest_reviews.nodes),
+            ci: ci_status(rollup.as_ref()),
+            merge: merge_status(&raw.mergeable, &raw.merge_state_status),
+            auto_merge: if raw.is_in_merge_queue {
+                AutoMerge::Queued {
+                    position: raw.merge_queue_entry.and_then(|entry| entry.position),
+                }
+            } else if raw.auto_merge_request.is_some() {
+                AutoMerge::Enabled
+            } else {
+                AutoMerge::Off
+            },
+            unresolved_threads: raw
+                .review_threads
+                .nodes
+                .iter()
+                .filter(|thread| !thread.is_resolved)
+                .count(),
+            labels: raw.labels.nodes.into_iter().map(Label::from).collect(),
+            body: clean_body(&raw.body),
+            title: raw.title,
+            head: raw.head_ref_name,
+            base: raw.base_ref_name,
+            is_draft: raw.is_draft,
+        }
+    }
+}
+
+impl From<RawLabel> for Label {
+    fn from(raw: RawLabel) -> Self {
+        let hex = u32::from_str_radix(&raw.color, 16).unwrap_or(0x808080);
+        Label {
+            name: raw.name,
+            rgb: ((hex >> 16) as u8, (hex >> 8) as u8, hex as u8),
+        }
+    }
+}
+
+/// `reviewDecision` is null when the repository doesn't require reviews, so
+/// fall back to the latest review from each reviewer.
+fn review_status(decision: Option<&str>, latest_reviews: &[RawReview]) -> Review {
+    match decision {
+        Some("APPROVED") => Review::Approved,
+        Some("CHANGES_REQUESTED") => Review::ChangesRequested,
+        Some(_) => Review::Required,
+        None if latest_reviews
+            .iter()
+            .any(|r| r.state == "CHANGES_REQUESTED") =>
+        {
+            Review::ChangesRequested
+        }
+        None if latest_reviews.iter().any(|r| r.state == "APPROVED") => Review::Approved,
+        None => Review::Required,
+    }
+}
+
+/// A single failed check marks CI as failed even while others are still
+/// running, since that's the actionable fact.
+fn ci_status(rollup: Option<&RawRollup>) -> Ci {
+    let Some(rollup) = rollup else {
+        return Ci {
+            state: CiState::None,
+            total: 0,
+            pending: 0,
+            failed: 0,
+        };
+    };
+    let counts = || {
+        let contexts = &rollup.contexts;
+        let check_runs = contexts.check_run_counts_by_state.iter().flatten();
+        check_runs.chain(contexts.status_context_counts_by_state.iter().flatten())
+    };
+    let sum = |states: &[&str]| -> u32 {
+        counts()
+            .filter(|c| states.contains(&c.state.as_str()))
+            .map(|c| c.count)
+            .sum()
+    };
+    let pending = sum(PENDING_STATES);
+    let failed = sum(FAILED_STATES);
+    let state = if failed > 0 || matches!(rollup.state.as_str(), "FAILURE" | "ERROR") {
+        CiState::Failed
+    } else if pending > 0 || matches!(rollup.state.as_str(), "PENDING" | "EXPECTED") {
+        CiState::Running
+    } else {
+        CiState::Passed
+    };
+    Ci {
+        state,
+        total: rollup.contexts.total_count,
+        pending,
+        failed,
+    }
+}
+
+fn merge_status(mergeable: &str, merge_state_status: &str) -> Merge {
+    match (mergeable, merge_state_status) {
+        ("CONFLICTING", _) | (_, "DIRTY") => Merge::Conflicts,
+        (_, "BEHIND") => Merge::Behind,
+        ("UNKNOWN", _) => Merge::Unknown,
+        _ => Merge::Clean,
+    }
+}
+
+/// Normalizes a PR body for terminal display: drops the HTML comments that PR
+/// templates leave behind, carriage returns, and tabs.
+fn clean_body(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + 3..],
+            None => rest = "",
+        }
+    }
+    out.push_str(rest);
+    out.replace('\r', "")
+        .replace('\t', "    ")
+        .trim()
+        .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a PR from a baseline response node with `fields` overriding it.
+    fn pr(fields: &str) -> PullRequest {
+        let mut node: serde_json::Value = serde_json::from_str(
+            r#"{
+                "number": 1, "title": "t", "body": "",
+                "isDraft": false, "headRefName": "feature", "baseRefName": "main",
+                "reviewDecision": null, "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN", "isInMergeQueue": false,
+                "mergeQueueEntry": null, "autoMergeRequest": null,
+                "labels": {"nodes": []}, "latestReviews": {"nodes": []},
+                "reviewThreads": {"nodes": []},
+                "commits": {"nodes": [{"commit": {"statusCheckRollup": null}}]}
+            }"#,
+        )
+        .unwrap();
+        let overrides: serde_json::Value = serde_json::from_str(&format!("{{{fields}}}")).unwrap();
+        for (key, value) in overrides.as_object().unwrap() {
+            node[key] = value.clone();
+        }
+        let response = serde_json::json!({"data": {"search": {"nodes": [node]}}});
+        parse_response(response.to_string().as_bytes())
+            .unwrap()
+            .remove(0)
+    }
+
+    fn rollup(state: &str, total: u32, check_runs: &str, statuses: &str) -> String {
+        format!(
+            r#""commits": {{"nodes": [{{"commit": {{"statusCheckRollup": {{
+                "state": "{state}",
+                "contexts": {{"totalCount": {total},
+                    "checkRunCountsByState": [{check_runs}],
+                    "statusContextCountsByState": [{statuses}]}}
+            }}}}}}]}}"#
+        )
+    }
+
+    #[test]
+    fn defaults_to_ready_needs_review_no_ci_clean() {
+        let pr = pr(r#""number": 7"#);
+        assert_eq!(pr.number, 7);
+        assert!(!pr.is_draft);
+        assert_eq!(pr.review, Review::Required);
+        assert_eq!(pr.ci.state, CiState::None);
+        assert_eq!(pr.merge, Merge::Clean);
+        assert_eq!(pr.auto_merge, AutoMerge::Off);
+        assert_eq!(pr.unresolved_threads, 0);
+    }
+
+    #[test]
+    fn draft() {
+        assert!(pr(r#""isDraft": true"#).is_draft);
+    }
+
+    #[test]
+    fn review_decision_wins() {
+        let approved = pr(r#""reviewDecision": "APPROVED""#);
+        assert_eq!(approved.review, Review::Approved);
+        let changes = pr(r#""reviewDecision": "CHANGES_REQUESTED""#);
+        assert_eq!(changes.review, Review::ChangesRequested);
+        let required = pr(r#""reviewDecision": "REVIEW_REQUIRED",
+            "latestReviews": {"nodes": [{"state": "APPROVED"}]}"#);
+        assert_eq!(required.review, Review::Required);
+    }
+
+    #[test]
+    fn review_falls_back_to_latest_reviews() {
+        let approved =
+            pr(r#""latestReviews": {"nodes": [{"state": "COMMENTED"}, {"state": "APPROVED"}]}"#);
+        assert_eq!(approved.review, Review::Approved);
+        let changes = pr(
+            r#""latestReviews": {"nodes": [{"state": "APPROVED"}, {"state": "CHANGES_REQUESTED"}]}"#,
+        );
+        assert_eq!(changes.review, Review::ChangesRequested);
+    }
+
+    #[test]
+    fn ci_passed_counts_skipped_as_done() {
+        let pr = pr(&rollup(
+            "SUCCESS",
+            7,
+            r#"{"state": "SKIPPED", "count": 5}, {"state": "SUCCESS", "count": 2}"#,
+            "",
+        ));
+        assert_eq!(
+            pr.ci,
+            Ci {
+                state: CiState::Passed,
+                total: 7,
+                pending: 0,
+                failed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn ci_running() {
+        let pr = pr(&rollup(
+            "PENDING",
+            7,
+            r#"{"state": "SUCCESS", "count": 3}, {"state": "IN_PROGRESS", "count": 2}, {"state": "QUEUED", "count": 1}"#,
+            r#"{"state": "PENDING", "count": 1}"#,
+        ));
+        assert_eq!(
+            pr.ci,
+            Ci {
+                state: CiState::Running,
+                total: 7,
+                pending: 4,
+                failed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn ci_failed_while_others_still_running() {
+        let pr = pr(&rollup(
+            "PENDING",
+            5,
+            r#"{"state": "FAILURE", "count": 1}, {"state": "IN_PROGRESS", "count": 2}"#,
+            r#"{"state": "ERROR", "count": 1}"#,
+        ));
+        assert_eq!(
+            pr.ci,
+            Ci {
+                state: CiState::Failed,
+                total: 5,
+                pending: 2,
+                failed: 2
+            }
+        );
+    }
+
+    #[test]
+    fn merge_states() {
+        assert_eq!(
+            pr(r#""mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY""#).merge,
+            Merge::Conflicts
+        );
+        assert_eq!(pr(r#""mergeStateStatus": "BEHIND""#).merge, Merge::Behind);
+        assert_eq!(
+            pr(r#""mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN""#).merge,
+            Merge::Unknown
+        );
+        assert_eq!(pr(r#""mergeStateStatus": "BLOCKED""#).merge, Merge::Clean);
+    }
+
+    #[test]
+    fn auto_merge_and_queue() {
+        let enabled = pr(r#""autoMergeRequest": {"enabledAt": "2026-09-13T00:00:00Z"}"#);
+        assert_eq!(enabled.auto_merge, AutoMerge::Enabled);
+        let queued = pr(
+            r#""isInMergeQueue": true, "mergeQueueEntry": {"position": 3},
+            "autoMergeRequest": {"enabledAt": "2026-09-13T00:00:00Z"}"#,
+        );
+        assert_eq!(queued.auto_merge, AutoMerge::Queued { position: Some(3) });
+    }
+
+    #[test]
+    fn counts_unresolved_threads() {
+        let pr = pr(r#""reviewThreads": {"nodes": [
+            {"isResolved": false}, {"isResolved": true}, {"isResolved": false}]}"#);
+        assert_eq!(pr.unresolved_threads, 2);
+    }
+
+    #[test]
+    fn parses_label_colors() {
+        let pr = pr(r#""labels": {"nodes": [
+            {"name": "bug", "color": "d73a4a"}, {"name": "odd", "color": "nothex"}]}"#);
+        assert_eq!(
+            pr.labels,
+            vec![
+                Label {
+                    name: "bug".into(),
+                    rgb: (0xd7, 0x3a, 0x4a)
+                },
+                Label {
+                    name: "odd".into(),
+                    rgb: (0x80, 0x80, 0x80)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cleans_body() {
+        let body = "<!-- template hint -->\r\nFixes the thing.\r\n\tIndented<!-- unterminated";
+        assert_eq!(clean_body(body), "Fixes the thing.\n    Indented");
+    }
+}
