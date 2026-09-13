@@ -20,3 +20,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  slow:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 600
