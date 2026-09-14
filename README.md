@@ -98,6 +98,15 @@ to add the label to the selected PR. While the request runs, the tag shows
 The tag and shortcut are hidden and disabled in repositories without this
 label. Label availability is checked on every refresh.
 
+## Pulling the default branch
+
+When code-flow runs with the default branch checked out, the footer offers
+`p pull main`. Press `p` to fetch the branch from `origin` and fast-forward to
+it; the footer then says how many commits came in. It never merges, rebases or
+resets. If your branch has commits that `origin` doesn't, or uncommitted
+changes would be overwritten, it leaves everything as it was and shows a
+warning in the footer. On any other branch, `p` isn't offered and does nothing.
+
 ## New branches and local worktrees
 
 Press `n` to start a new change. Type a name; it becomes a branch named
@@ -134,6 +143,7 @@ deletes the branch too if it's empty or merged, and keeps it otherwise.
 | `w` | open the PR in a [worktrunk](https://worktrunk.dev) worktree and, inside [Herdr](https://herdr.dev), a Herdr workspace there (both optional); if the PR's branch is checked out in your main checkout, offers to move it to a worktree. On a local worktree, reopens its Herdr workspace |
 | `W` | remove the selected worktree and close its Herdr workspace, after confirming |
 | `n` | create a new branch in its own worktree and Herdr workspace; see [New branches](#new-branches-and-local-worktrees) |
+| `p` | fast-forward the default branch from `origin`, when it's checked out; see [Pulling](#pulling-the-default-branch) |
 | `r` | refresh (also automatic every 60s) |
 | `?` | key bindings |
 | `q`, `Esc` | quit |

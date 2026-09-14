@@ -528,6 +528,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     .areas(area);
     frame.render_widget(status, right);
 
+    let pull = format!("pull {}", app.default_branch);
     let hint = match app.flash() {
         Some(flash) if flash.is_error => Line::from(format!(" {}", flash.text).red()),
         Some(flash) => Line::from(format!(" {}", flash.text).green()),
@@ -549,7 +550,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 None => {}
             }
-            keys.extend([("n", "new branch"), ("r", "refresh")]);
+            keys.push(("n", "new branch"));
+            if app.can_pull() {
+                keys.push(("p", &pull));
+            }
+            keys.push(("r", "refresh"));
             if !matches!(app.selected(), Some(Row::Local(_))) {
                 keys.push(("J/K", "scroll"));
             }
@@ -576,6 +581,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
         key("w", "worktree (+ Herdr workspace)"),
         key("W", "remove the selected worktree"),
         key("n", "new branch in its own worktree"),
+        key("p", "pull the default branch, when on it"),
         key("r", "refresh now (auto every 60s)"),
         key("q  Esc", "quit"),
     ];
@@ -1003,6 +1009,24 @@ mod tests {
             branch_fate(Some(Progress::Merged)),
             "The branch is merged, so it's deleted too."
         );
+    }
+
+    #[test]
+    fn offers_pull_only_on_the_default_branch() {
+        let mut app = app_with(vec![]);
+        assert!(!render(&mut app).contains("pull main"));
+        app.current_branch = Some("me/feature".into());
+        assert!(!render(&mut app).contains("pull main"));
+
+        app.current_branch = Some("main".into());
+        let screen = render(&mut app);
+        assert!(
+            screen.contains(" n new branch  p pull main  r refresh "),
+            "{screen}"
+        );
+
+        app.pulling = true;
+        assert!(!render(&mut app).contains("pull main"));
     }
 
     #[test]

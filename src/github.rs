@@ -185,7 +185,7 @@ pub fn checkout(repo: &str, number: u64) -> Result<Checkout> {
     let args = ["pr", "checkout", &number.to_string(), "--repo", repo];
     let output = run("gh", &args)?;
     if !output.status.success() && is_diverged(&String::from_utf8_lossy(&output.stderr)) {
-        let branch = git(&["branch", "--show-current"])?;
+        let branch = current_branch()?;
         return Ok(Checkout::Diverged { branch });
     }
     let output = check("gh", &args, output)?;
@@ -213,6 +213,43 @@ pub fn force_checkout(repo: &str, number: u64) -> Result<()> {
 
 fn is_diverged(stderr: &str) -> bool {
     stderr.contains("Not possible to fast-forward")
+}
+
+/// The branch checked out in the current directory; empty when detached.
+pub fn current_branch() -> Result<String> {
+    git(&["branch", "--show-current"])
+}
+
+/// Fast-forwards the default branch to `origin` if it's checked out here,
+/// returning how many commits came in, or `None` on any other branch.
+///
+/// Never merges, rebases or resets: when local commits have diverged or
+/// uncommitted changes would be overwritten, git refuses and this fails.
+pub fn pull_default_branch(default_branch: &str) -> Result<Option<u32>> {
+    if current_branch()? != default_branch {
+        return Ok(None);
+    }
+    git(&["fetch", "origin", default_branch])?;
+    let before = git(&["rev-parse", "HEAD"])?;
+    let upstream = format!("origin/{default_branch}");
+    let args = ["merge", "--ff-only", &upstream];
+    let output = run("git", &args)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_diverged(&stderr) {
+            bail!("your {default_branch} has commits {upstream} doesn't, so it can't fast-forward");
+        }
+        if stderr.contains("would be overwritten") {
+            bail!("uncommitted changes would be overwritten; commit or stash them first");
+        }
+    }
+    check("git", &args, output)?;
+    let count = git(&["rev-list", "--count", &format!("{before}..HEAD")])?;
+    Ok(Some(
+        count
+            .parse()
+            .context("unexpected output from `git rev-list`")?,
+    ))
 }
 
 pub fn open_in_browser(repo: &str, number: u64) -> Result<()> {
