@@ -13,10 +13,12 @@ Requires the [GitHub CLI](https://cli.github.com/), logged in with `gh auth logi
 cargo install --path .
 ```
 
-Then run `code-flow` from inside a clone of a GitHub repository.
+This installs both `code-flow` and `cl`. Run either command from inside a clone
+of a GitHub repository; both launch the same application. For local development,
+plain `cargo run` launches `code-flow`, and `cargo run --bin cl` launches `cl`.
 
 If you have [just](https://just.systems), the [justfile](justfile) wraps the
-steps below: `just install` installs code-flow, `just install-tools` installs
+steps below: `just install` installs both commands, `just install-tools` installs
 worktrunk and Herdr for your OS, `just install-skills` installs their agent
 skills, and `just install-all` does all three. Run `just` to list every recipe.
 

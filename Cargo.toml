@@ -4,6 +4,15 @@ version = "0.1.0"
 authors = ["David Weis <dweis7@gmail.com>"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
+default-run = "code-flow"
+
+[[bin]]
+name = "code-flow"
+path = "src/main.rs"
+
+[[bin]]
+name = "cl"
+path = "src/bin/cl.rs"
 
 [dependencies]
 anyhow = "1.0.104"

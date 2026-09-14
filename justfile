@@ -3,7 +3,7 @@
 default:
     @just --list
 
-# Install code-flow from this checkout
+# Install code-flow and cl from this checkout
 install:
     cargo install --path . --locked
 
