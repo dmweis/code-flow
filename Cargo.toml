@@ -3,6 +3,12 @@ name = "code-flow"
 version = "0.1.0"
 authors = ["David Weis <dweis7@gmail.com>"]
 edition = "2024"
+rust-version = "1.88"
+description = "A terminal UI for your open GitHub pull requests, with their review, CI, and merge status at a glance"
+repository = "https://github.com/dmweis/code-flow"
+readme = "README.md"
+keywords = ["github", "pull-request", "tui", "git", "worktree"]
+categories = ["command-line-utilities", "development-tools"]
 license = "MIT OR Apache-2.0"
 default-run = "code-flow"
 

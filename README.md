@@ -10,8 +10,10 @@ repository, with their review, CI, and merge status at a glance.
 Requires the [GitHub CLI](https://cli.github.com/), logged in with `gh auth login`.
 
 ```sh
-cargo install --path .
+cargo install --locked --git https://github.com/dmweis/code-flow
 ```
+
+Or, from a clone of this repository, `cargo install --path .`.
 
 This installs both `code-flow` and `cf`. Run either command from inside a clone
 of a GitHub repository; both launch the same application. For local development,
@@ -153,6 +155,14 @@ deletes the branch too if it's empty or merged, and keeps it otherwise.
 | `r` | refresh (also automatic every 60s) |
 | `?` | key bindings |
 | `q`, `Esc` | quit |
+
+## Mock pull requests
+
+The open `[MOCK]` pull requests in this repository, on `mock/*` branches,
+are test fixtures and will never be merged. Each one sets up a status for
+code-flow to show, such as failing or slow CI, conflicts, a draft, unresolved
+threads, or a long description. code-flow only lists your own PRs, so they
+appear only for the repository owner.
 
 ## License
 
