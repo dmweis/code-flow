@@ -11,7 +11,7 @@ use std::process::{Command, Output, Stdio};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::github::git_in;
+use crate::github::{git_in, has_uncommitted_changes};
 use crate::model::{Progress, Worktree, WorktreeStatus};
 
 pub struct OpenedWorktree {
@@ -132,12 +132,7 @@ pub fn move_to_worktree(
     default_branch: &str,
 ) -> Result<OpenOutcome> {
     // Switching would carry uncommitted changes onto the default branch.
-    if !git_in(
-        main_path,
-        &["status", "--porcelain", "--untracked-files=no"],
-    )?
-    .is_empty()
-    {
+    if has_uncommitted_changes(main_path)? {
         bail!("Your main checkout has uncommitted changes; commit or stash them first");
     }
     git_in(main_path, &["switch", default_branch])?;
@@ -398,11 +393,18 @@ fn herdr_error(stderr: &[u8]) -> String {
 
 /// Abbreviates the home directory to `~`.
 pub fn tilde(path: &str) -> String {
-    match env::var("HOME") {
-        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
-            format!("~{}", &path[home.len()..])
-        }
-        _ => path.to_owned(),
+    tilde_from(path, &env::var("HOME").unwrap_or_default())
+}
+
+/// Matches whole path components, so `/home/bob2` isn't under `/home/bob`.
+fn tilde_from(path: &str, home: &str) -> String {
+    if home.is_empty() {
+        return path.to_owned();
+    }
+    match Path::new(path).strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.to_owned(),
     }
 }
 
@@ -649,6 +651,29 @@ mod tests {
         assert_eq!(slugify("  --Add  v1.2 / docs--  "), "add-v1-2-docs");
         assert_eq!(slugify("Café résumé!"), "caf-rsum");
         assert_eq!(slugify("?!'\""), "");
+    }
+
+    #[test]
+    fn abbreviates_only_paths_inside_home() {
+        let home = "/home/bob";
+        assert_eq!(tilde_from("/home/bob", home), "~");
+        assert_eq!(tilde_from("/home/bob/src/repo", home), "~/src/repo");
+        assert_eq!(tilde_from("/home/bob/src/repo", "/home/bob/"), "~/src/repo");
+        assert_eq!(tilde_from("/home/bob2/repo", home), "/home/bob2/repo");
+        assert_eq!(tilde_from("/src/repo", home), "/src/repo");
+        assert_eq!(tilde_from("/home/bob/repo", ""), "/home/bob/repo");
+    }
+
+    #[test]
+    fn refuses_to_remove_the_worktree_it_runs_in() {
+        // Both are refused before worktrunk runs.
+        for path in [".", ".."] {
+            let err = remove("code-flow-test-no-such-branch", path).unwrap_err();
+            assert!(
+                err.to_string().contains("running inside this worktree"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
