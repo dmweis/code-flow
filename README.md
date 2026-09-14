@@ -84,12 +84,17 @@ words. Only states worth acting on are shown:
 | Draft | `◌ draft` (replaces "needs review" until someone reviews) |
 | Review | `◷ needs review`, `✓ approved`, `✗ changes requested` |
 | CI | `⟳ CI 3/7` (running, done/total), `✓ CI passed`, `✗ CI 2 failed`, `· no CI` |
-| Merge | `⚠ conflicts`, `↓ behind base` |
+| Merge | `⚠ conflicts`, `↓ behind base`, `⇥ ready to merge` |
 | Auto-merge | `» auto-merge`, `≡ queued #2` |
 | Threads | `2 threads` unresolved review threads |
 | Worktree | `⌂ worktree` the PR has its own worktree |
 
 The detail pane on the right spells out every status in full and shows the PR description.
+
+A PR is `⇥ ready to merge` when GitHub reports nothing blocking a merge
+(no conflicts, and any required reviews and checks are satisfied), and it
+is not a draft, has no changes requested, has CI passed or no CI, and does not
+already have auto-merge enabled. Press `m` to merge it.
 
 For repositories that define a `claude-review` label, each PR's status line also shows
 `✓ claude-review` when labeled or `· no claude-review` otherwise. Press `l`
@@ -131,6 +136,7 @@ deletes the branch too if it's empty or merged, and keeps it otherwise.
 | `o`, `Enter` | open PR in browser |
 | `l` | add `claude-review` to the selected PR, if the repository defines the label and the PR does not already have it |
 | `c` | `gh pr checkout` the selected PR; if your local branch has diverged (e.g. the PR was rebased), offers to reset it |
+| `m` | merge the selected PR, if it's ready to merge, after confirming. Uses the merge method GitHub preselects for you in the repository, and fails if commits were pushed since the last refresh. In a repository with a merge queue, adds it to the queue. While the merge runs, the PR shows `⟳ merging` |
 | `w` | open the PR in a [worktrunk](https://worktrunk.dev) worktree and, inside [Herdr](https://herdr.dev), a Herdr workspace there (both optional); if the PR's branch is checked out in your main checkout, offers to move it to a worktree. On a local worktree, reopens its Herdr workspace |
 | `W` | remove the selected worktree and close its Herdr workspace, after confirming |
 | `n` | create a new branch in its own worktree and Herdr workspace; see [New branches](#new-branches-and-local-worktrees) |

@@ -11,8 +11,8 @@ use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Padding, 
 
 use crate::app::{App, Prompt, Row};
 use crate::model::{
-    AutoMerge, CLAUDE_REVIEW_LABEL, Ci, CiState, Label, Merge, Progress, PullRequest, Review,
-    Worktree,
+    AutoMerge, CLAUDE_REVIEW_LABEL, Ci, CiState, Label, Merge, MergeMethod, Progress, PullRequest,
+    Review, Worktree,
 };
 use crate::worktree::tilde;
 
@@ -151,6 +151,31 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, default_branch: &str) {
             "remove",
             "keep",
         ),
+        Prompt::Merge {
+            number,
+            title,
+            base,
+            method,
+            ..
+        } => (
+            " Merge pull request ",
+            vec![
+                Line::from(vec![
+                    format!("{} PR #{number} ", merge_verb(*method)).into(),
+                    title.as_str().bold(),
+                    " into ".into(),
+                    base.as_str().bold(),
+                    "?".into(),
+                ]),
+                Line::default(),
+                Line::from(
+                    "This uses your default merge method for this repository. \
+                     GitHub refuses if commits were pushed since the last refresh.",
+                ),
+            ],
+            "merge",
+            "cancel",
+        ),
     };
     lines.extend([
         Line::default(),
@@ -163,6 +188,15 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, default_branch: &str) {
         .centered(),
     ]);
     draw_dialog(frame, title, lines);
+}
+
+/// The words on GitHub's merge button.
+fn merge_verb(method: MergeMethod) -> &'static str {
+    match method {
+        MergeMethod::Merge => "Merge",
+        MergeMethod::Squash => "Squash and merge",
+        MergeMethod::Rebase => "Rebase and merge",
+    }
 }
 
 /// What `wt remove` does with a branch, which it deletes only once merged.
@@ -295,6 +329,7 @@ fn draw_prs(frame: &mut Frame, app: &mut App, area: Rect) {
             pr,
             app.worktree_for(pr).is_some(),
             claude_review_badge(app, pr),
+            app.merging.contains(&pr.number),
         ) {
             status.extend([badge, Span::raw("  ")]);
         }
@@ -322,6 +357,7 @@ fn status_badges(
     pr: &PullRequest,
     has_worktree: bool,
     claude_review: Option<Span<'static>>,
+    merging: bool,
 ) -> Vec<Span<'static>> {
     let badge = |glyph: Span<'static>, text: &str| {
         Span::styled(format!("{} {text}", glyph.content), glyph.style)
@@ -351,7 +387,12 @@ fn status_badges(
     match pr.merge {
         Merge::Conflicts => badges.push(badge(merge_glyph(pr.merge), "conflicts")),
         Merge::Behind => badges.push(badge(merge_glyph(pr.merge), "behind base")),
-        Merge::Clean | Merge::Unknown => {}
+        Merge::Ready | Merge::Clean | Merge::Unknown => {}
+    }
+    if merging {
+        badges.push("⟳ merging".yellow());
+    } else if pr.is_ready_to_merge() {
+        badges.push(badge(ready_glyph(), "ready to merge"));
     }
     let glyph = auto_merge_glyph(pr.auto_merge);
     match pr.auto_merge {
@@ -492,7 +533,10 @@ fn header_lines(pr: &PullRequest, worktree: Option<String>) -> Vec<Line<'_>> {
         review_text(pr.review).into(),
     ));
     lines.push(status(ci_glyph(pr.ci), ci_text(pr.ci)));
-    lines.push(status(merge_glyph(pr.merge), merge_text(pr.merge).into()));
+    lines.push(match pr.is_ready_to_merge() {
+        true => status(ready_glyph(), "Ready to merge".into()),
+        false => status(merge_glyph(pr.merge), merge_text(pr.merge).into()),
+    });
     if let Some(text) = auto_merge_text(pr.auto_merge) {
         lines.push(status(auto_merge_glyph(pr.auto_merge), text));
     }
@@ -536,6 +580,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             match app.selected() {
                 Some(Row::Pr(pr)) => {
                     keys.extend([("o", "open"), ("c", "checkout"), ("w", "worktree")]);
+                    if app.can_merge(pr) {
+                        keys.push(("m", "merge"));
+                    }
                     if app.can_add_claude_review(pr) {
                         keys.push(("l", "add claude-review"));
                     }
@@ -573,6 +620,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
         key("J/K  PgUp/Dn", "scroll description"),
         key("o  Enter", "open in browser"),
         key("c", "gh pr checkout"),
+        key("m", "merge, once ready to merge"),
         key("w", "worktree (+ Herdr workspace)"),
         key("W", "remove the selected worktree"),
         key("n", "new branch in its own worktree"),
@@ -580,7 +628,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
         key("q  Esc", "quit"),
     ];
     if app.claude_review_label.is_some() {
-        lines.insert(5, key("l", "add claude-review label"));
+        lines.insert(6, key("l", "add claude-review label"));
     }
     let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 3;
     let height = lines.len() as u16 + 2;
@@ -713,9 +761,13 @@ fn ci_text(ci: Ci) -> String {
     }
 }
 
+fn ready_glyph() -> Span<'static> {
+    "⇥".green()
+}
+
 fn merge_glyph(merge: Merge) -> Span<'static> {
     match merge {
-        Merge::Clean => "✓".green(),
+        Merge::Ready | Merge::Clean => "✓".green(),
         Merge::Conflicts => "⚠".red(),
         Merge::Behind => "↓".yellow(),
         Merge::Unknown => "?".dark_gray(),
@@ -724,7 +776,7 @@ fn merge_glyph(merge: Merge) -> Span<'static> {
 
 fn merge_text(merge: Merge) -> &'static str {
     match merge {
-        Merge::Clean => "No conflicts",
+        Merge::Ready | Merge::Clean => "No conflicts",
         Merge::Conflicts => "Merge conflicts",
         Merge::Behind => "Behind base branch",
         Merge::Unknown => "Mergeability unknown",
@@ -754,7 +806,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::app::tests::{app_with, claude_label, sample_pr, sample_worktree};
+    use crate::app::tests::{app_with, claude_label, ready_pr, sample_pr, sample_worktree};
 
     fn render(app: &mut App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(150, 24)).unwrap();
@@ -835,7 +887,7 @@ mod tests {
         pr.merge = Merge::Clean;
         pr.auto_merge = AutoMerge::Off;
         pr.unresolved_threads = 1;
-        let text: Vec<_> = status_badges(&pr, false, None)
+        let text: Vec<_> = status_badges(&pr, false, None, false)
             .iter()
             .map(|s| s.content.to_string())
             .collect();
@@ -851,7 +903,7 @@ mod tests {
         pr.merge = Merge::Behind;
         pr.auto_merge = AutoMerge::Queued { position: Some(2) };
         pr.unresolved_threads = 0;
-        let text: Vec<_> = status_badges(&pr, false, None)
+        let text: Vec<_> = status_badges(&pr, false, None, false)
             .iter()
             .map(|s| s.content.to_string())
             .collect();
@@ -865,6 +917,49 @@ mod tests {
                 "≡ queued #2"
             ]
         );
+    }
+
+    #[test]
+    fn shows_and_offers_merge_only_when_ready() {
+        let mut app = app_with(vec![ready_pr(482, "Add retry logic"), sample_pr(9, "b")]);
+        let screen = render(&mut app);
+        assert!(
+            screen.contains("✓ approved  ✓ CI passed  ⇥ ready to merge  12 threads"),
+            "{screen}"
+        );
+        assert!(screen.contains("⇥ Ready to merge"), "{screen}");
+        assert!(!screen.contains("No conflicts"), "{screen}");
+        assert!(screen.contains(" m merge "), "{screen}");
+
+        app.merging.insert(482);
+        let screen = render(&mut app);
+        assert!(screen.contains("✓ CI passed  ⟳ merging"), "{screen}");
+        assert!(!screen.contains(" m merge "), "{screen}");
+
+        app.list.select(Some(1));
+        let screen = render(&mut app);
+        assert!(!screen.contains("ready to merge"), "{screen}");
+        assert!(!screen.contains(" m merge "), "{screen}");
+    }
+
+    #[test]
+    fn renders_merge_prompt_with_the_merge_method() {
+        let mut app = app_with(vec![ready_pr(482, "Add retry logic")]);
+        app.prompt = Some(Prompt::Merge {
+            number: 482,
+            title: "Add retry logic".into(),
+            base: "main".into(),
+            head_oid: "abc123".into(),
+            method: MergeMethod::Squash,
+        });
+        let screen = render(&mut app);
+        assert!(screen.contains("Merge pull request"), "{screen}");
+        assert!(
+            screen.contains("Squash and merge PR #482 Add retry logic into main?"),
+            "{screen}"
+        );
+        assert!(screen.contains(" y  merge"), "{screen}");
+        assert!(screen.contains(" n  cancel"), "{screen}");
     }
 
     #[test]
