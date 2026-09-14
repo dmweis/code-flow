@@ -1,6 +1,6 @@
-# pr-triage
+# code-flow
 
-[![CI](https://github.com/dmweis/pr-triage/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dmweis/pr-triage/actions/workflows/ci.yml?query=branch%3Amain)
+[![CI](https://github.com/dmweis/code-flow/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dmweis/code-flow/actions/workflows/ci.yml?query=branch%3Amain)
 
 A terminal UI that lists your open pull requests in the current GitHub
 repository, with their review, CI, and merge status at a glance.
@@ -13,7 +13,7 @@ Requires the [GitHub CLI](https://cli.github.com/), logged in with `gh auth logi
 cargo install --path .
 ```
 
-Then run `pr-triage` from inside a clone of a GitHub repository.
+Then run `code-flow` from inside a clone of a GitHub repository.
 
 ## Statuses
 

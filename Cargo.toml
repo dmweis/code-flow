@@ -1,5 +1,5 @@
 [package]
-name = "pr-triage"
+name = "code-flow"
 version = "0.1.0"
 authors = ["David Weis <dweis7@gmail.com>"]
 edition = "2024"

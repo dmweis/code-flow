@@ -105,7 +105,7 @@ pub fn list_worktrees() -> Result<HashMap<String, String>> {
 pub fn remove(branch: &str, path: &str) -> Result<bool> {
     let cwd = env::current_dir().context("failed to read the current directory")?;
     if fs::canonicalize(&cwd)?.starts_with(fs::canonicalize(path)?) {
-        bail!("pr-triage is running inside this worktree; run it from elsewhere to remove it");
+        bail!("code-flow is running inside this worktree; run it from elsewhere to remove it");
     }
     let Some(output) = run("wt", &["remove", branch, "--foreground"])? else {
         bail!("worktrunk (wt) is not installed; see https://worktrunk.dev");
@@ -215,7 +215,7 @@ fn open_workspace(path: &str, label: &str) -> Result<Workspace> {
         args.extend_from_slice(target);
         run("herdr", &args)
     };
-    // Group the worktree under the workspace pr-triage runs in. Herdr refuses
+    // Group the worktree under the workspace code-flow runs in. Herdr refuses
     // if that workspace belongs to another directory; then let it find the
     // repo from our working directory, creating a workspace group if needed.
     let workspace_id = env::var("HERDR_WORKSPACE_ID").unwrap_or_default();
@@ -259,7 +259,7 @@ fn close_workspace_at(path: &str) -> Result<bool> {
         serde_json::from_slice(&output.stdout).context("unexpected output from herdr")?;
     let own_workspace = env::var("HERDR_WORKSPACE_ID").unwrap_or_default();
     let Some(workspace) = response.result.workspaces.into_iter().find(|workspace| {
-        // Never close the workspace pr-triage itself runs in.
+        // Never close the workspace code-flow itself runs in.
         workspace.workspace_id != own_workspace
             && workspace
                 .worktree
@@ -343,17 +343,17 @@ mod tests {
 
     #[test]
     fn parses_wt_switch_json() {
-        let created = r#"{"action":"created","branch":"mock/failing-test","path":"/src/pr-triage.mock-failing-test","created_branch":false,"from_remote":"origin/mock/failing-test"}"#;
+        let created = r#"{"action":"created","branch":"mock/failing-test","path":"/src/code-flow.mock-failing-test","created_branch":false,"from_remote":"origin/mock/failing-test"}"#;
         let switched: WtSwitch = serde_json::from_str(created).unwrap();
-        assert_eq!(switched.path, "/src/pr-triage.mock-failing-test");
-        let existing = r#"{"action":"existing","branch":"mock/failing-test","path":"/src/pr-triage.mock-failing-test"}"#;
+        assert_eq!(switched.path, "/src/code-flow.mock-failing-test");
+        let existing = r#"{"action":"existing","branch":"mock/failing-test","path":"/src/code-flow.mock-failing-test"}"#;
         assert!(serde_json::from_str::<WtSwitch>(existing).is_ok());
     }
 
     #[test]
     fn explains_hook_approval_failure() {
         let stderr = "◎ Fetching PR #5...\n\
-            ▲ pr-triage needs approval to execute 1 command:\n\
+            ▲ code-flow needs approval to execute 1 command:\n\
             ○ pre-start:\n  echo hook-ran > hook-ran.txt\n\
             ✗ Cannot prompt for approval in non-interactive environment\n\
             ↳ To skip prompts in CI/CD, add --yes; to pre-approve commands, run wt config approvals add --yes";
@@ -382,7 +382,7 @@ mod tests {
         assert!(!response.result.already_open);
 
         let list = r#"{"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[
-            {"workspace_id":"w2","label":"pr-triage","focused":true},
+            {"workspace_id":"w2","label":"code-flow","focused":true},
             {"workspace_id":"w4","label":"PR 3","worktree":{"checkout_path":"/src/r.x","is_linked_worktree":true}}]}}"#;
         let response: HerdrResponse<HerdrWorkspaces> = serde_json::from_str(list).unwrap();
         let paths: Vec<_> = response
