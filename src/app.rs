@@ -1,6 +1,6 @@
 //! Application state, input handling, and the main event loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,8 +10,8 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 
-use crate::github::{self, Checkout, Repo};
-use crate::model::PullRequest;
+use crate::github::{self, Checkout, PrSnapshot, Repo};
+use crate::model::{Label, PullRequest};
 use crate::ui;
 use crate::worktree::{self, OpenOutcome};
 
@@ -21,7 +21,8 @@ const FLASH_DURATION: Duration = Duration::from_secs(5);
 
 /// Results of background work, sent back to the event loop.
 enum Msg {
-    Prs(Result<Vec<PullRequest>>, HashMap<String, String>),
+    Prs(Result<PrSnapshot>, HashMap<String, String>),
+    ClaudeReviewAdded(u64, Label, Result<()>),
     Worktrees(Result<HashMap<String, String>>),
     CheckedOut(u64, Result<Checkout>),
     Opened(Result<()>),
@@ -58,6 +59,10 @@ pub struct App {
     pub repo: String,
     pub default_branch: String,
     pub prs: Vec<PullRequest>,
+    pub claude_review_label: Option<Label>,
+    pub adding_claude_review: HashSet<u64>,
+    /// Successful edits that an already-running refresh may not have seen.
+    claude_review_updates: HashMap<u64, Label>,
     /// Linked worktree paths by branch name.
     pub worktrees: HashMap<String, String>,
     pub list: ListState,
@@ -101,6 +106,9 @@ impl App {
             repo: repo.name,
             default_branch: repo.default_branch,
             prs: Vec::new(),
+            claude_review_label: None,
+            adding_claude_review: HashSet::new(),
+            claude_review_updates: HashMap::new(),
             worktrees: HashMap::new(),
             list: ListState::default(),
             detail_scroll: 0,
@@ -122,6 +130,29 @@ impl App {
 
     pub fn worktree_for(&self, pr: &PullRequest) -> Option<&str> {
         self.worktrees.get(&pr.head).map(String::as_str)
+    }
+
+    pub fn can_add_claude_review(&self, pr: &PullRequest) -> bool {
+        self.claude_review_label.is_some()
+            && !pr.has_claude_review()
+            && !self.adding_claude_review.contains(&pr.number)
+    }
+
+    fn add_claude_review(&mut self) {
+        let Some(pr) = self
+            .selected_pr()
+            .filter(|pr| self.can_add_claude_review(pr))
+        else {
+            return;
+        };
+        let number = pr.number;
+        let label = self.claude_review_label.clone().unwrap();
+        let repo = self.repo.clone();
+        self.adding_claude_review.insert(number);
+        self.set_flash(format!("Adding claude-review to #{number}…"), false);
+        self.spawn(move || {
+            Msg::ClaudeReviewAdded(number, label, github::add_claude_review(&repo, number))
+        });
     }
 
     pub fn flash(&self) -> Option<&Flash> {
@@ -149,7 +180,7 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        if self.loading_since.is_some() {
+        if self.loading_since.is_some() || !self.adding_claude_review.is_empty() {
             return;
         }
         self.loading_since = Some(Instant::now());
@@ -187,7 +218,17 @@ impl App {
                 self.last_attempt = Some(Instant::now());
                 self.worktrees = worktrees;
                 match result {
-                    Ok(prs) => self.set_prs(prs),
+                    Ok(mut snapshot) => {
+                        for pr in &mut snapshot.prs {
+                            if let Some(label) = self.claude_review_updates.get(&pr.number)
+                                && !pr.has_claude_review()
+                            {
+                                pr.labels.push(label.clone());
+                            }
+                        }
+                        self.claude_review_label = snapshot.claude_review_label;
+                        self.set_prs(snapshot.prs);
+                    }
                     Err(err) => {
                         let text = format!("{err:#}");
                         if !self.prs.is_empty() {
@@ -195,6 +236,27 @@ impl App {
                         }
                         self.load_error = Some(text);
                     }
+                }
+                self.claude_review_updates.clear();
+            }
+            Msg::ClaudeReviewAdded(number, label, result) => {
+                self.adding_claude_review.remove(&number);
+                match result {
+                    Ok(()) => {
+                        if let Some(pr) = self.prs.iter_mut().find(|pr| pr.number == number)
+                            && !pr.has_claude_review()
+                        {
+                            pr.labels.push(label.clone());
+                        }
+                        if self.loading_since.is_some() {
+                            self.claude_review_updates.insert(number, label);
+                        }
+                        self.set_flash(format!("Added claude-review to #{number}"), false);
+                    }
+                    Err(err) => self.set_flash(
+                        format!("Could not add claude-review to #{number}: {err:#}"),
+                        true,
+                    ),
                 }
             }
             Msg::Worktrees(Ok(worktrees)) => self.worktrees = worktrees,
@@ -295,6 +357,7 @@ impl App {
             KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('l') => self.add_claude_review(),
             KeyCode::Char('o') | KeyCode::Enter => {
                 if let Some(pr) = self.selected_pr() {
                     let (repo, number) = (self.repo.clone(), pr.number);
@@ -439,6 +502,101 @@ pub(crate) mod tests {
         app.on_key(KeyEvent::from(KeyCode::Char(c)));
     }
 
+    pub fn claude_label() -> Label {
+        Label {
+            name: "claude-review".into(),
+            rgb: (170, 187, 204),
+        }
+    }
+
+    #[test]
+    fn claude_shortcut_is_disabled_when_unavailable_already_labeled_or_pending() {
+        let mut app = app_with(vec![sample_pr(1, "a")]);
+        press(&mut app, 'l');
+        assert!(app.adding_claude_review.is_empty());
+        assert!(app.flash().is_none());
+
+        app.claude_review_label = Some(claude_label());
+        assert!(app.can_add_claude_review(&app.prs[0]));
+        app.adding_claude_review.insert(1);
+        assert!(!app.can_add_claude_review(&app.prs[0]));
+        press(&mut app, 'l');
+        assert!(app.flash().is_none());
+
+        app.adding_claude_review.clear();
+        app.prs[0].labels.push(claude_label());
+        assert!(!app.can_add_claude_review(&app.prs[0]));
+        press(&mut app, 'l');
+        assert!(app.adding_claude_review.is_empty());
+        assert!(app.flash().is_none());
+
+        app.set_prs(vec![]);
+        press(&mut app, 'l');
+        assert!(app.adding_claude_review.is_empty());
+    }
+
+    #[test]
+    fn claude_success_updates_target_even_after_selection_changes() {
+        let mut app = app_with(vec![sample_pr(1, "a"), sample_pr(2, "b")]);
+        app.claude_review_label = Some(claude_label());
+        app.adding_claude_review.insert(1);
+        app.select(1);
+        app.on_msg(Msg::ClaudeReviewAdded(1, claude_label(), Ok(())));
+        assert!(app.prs[0].has_claude_review());
+        assert!(!app.prs[1].has_claude_review());
+        assert!(app.adding_claude_review.is_empty());
+        assert_eq!(app.selected_pr().unwrap().number, 2);
+        assert!(!app.flash().unwrap().is_error);
+        // A refresh that already included the label must not produce duplicates.
+        app.on_msg(Msg::ClaudeReviewAdded(1, claude_label(), Ok(())));
+        assert_eq!(app.prs[0].labels.len(), 2);
+    }
+
+    #[test]
+    fn claude_failure_preserves_labels_and_allows_retry() {
+        let mut app = app_with(vec![sample_pr(1, "a")]);
+        app.claude_review_label = Some(claude_label());
+        app.adding_claude_review.insert(1);
+        let labels = app.prs[0].labels.clone();
+        app.on_msg(Msg::ClaudeReviewAdded(
+            1,
+            claude_label(),
+            Err(anyhow::anyhow!("permission denied")),
+        ));
+        assert_eq!(app.prs[0].labels, labels);
+        assert!(app.can_add_claude_review(&app.prs[0]));
+        assert!(app.flash().unwrap().is_error);
+        assert!(app.flash().unwrap().text.contains("permission denied"));
+    }
+
+    #[test]
+    fn refresh_does_not_undo_a_label_added_while_fetching() {
+        let mut app = app_with(vec![sample_pr(1, "a")]);
+        app.loading_since = Some(Instant::now());
+        app.on_msg(Msg::ClaudeReviewAdded(1, claude_label(), Ok(())));
+        app.on_msg(Msg::Prs(
+            Ok(PrSnapshot {
+                prs: vec![sample_pr(1, "a")],
+                claude_review_label: Some(claude_label()),
+            }),
+            HashMap::new(),
+        ));
+        assert!(app.prs[0].has_claude_review());
+        assert!(app.claude_review_updates.is_empty());
+
+        // Later refreshes are authoritative, including external removal.
+        app.on_msg(Msg::Prs(
+            Ok(PrSnapshot {
+                prs: vec![sample_pr(1, "a")],
+                claude_review_label: None,
+            }),
+            HashMap::new(),
+        ));
+        assert!(!app.prs[0].has_claude_review());
+        assert!(app.claude_review_label.is_none());
+        assert!(!app.can_add_claude_review(&app.prs[0]));
+    }
+
     #[test]
     fn refresh_keeps_selected_pr_by_number() {
         let mut app = app_with(vec![
@@ -548,7 +706,13 @@ pub(crate) mod tests {
     fn refresh_updates_worktrees() {
         let mut app = app_with(vec![sample_pr(3, "a")]);
         let worktrees = HashMap::from([("feature".to_owned(), "/src/repo.feature".to_owned())]);
-        app.on_msg(Msg::Prs(Ok(vec![sample_pr(3, "a")]), worktrees));
+        app.on_msg(Msg::Prs(
+            Ok(PrSnapshot {
+                prs: vec![sample_pr(3, "a")],
+                claude_review_label: None,
+            }),
+            worktrees,
+        ));
         assert_eq!(app.worktree_for(&app.prs[0]), Some("/src/repo.feature"));
     }
 

@@ -10,7 +10,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph, Wrap};
 
 use crate::app::{App, Prompt};
-use crate::model::{AutoMerge, Ci, CiState, Label, Merge, PullRequest, Review};
+use crate::model::{
+    AutoMerge, CLAUDE_REVIEW_LABEL, Ci, CiState, Label, Merge, PullRequest, Review,
+};
 use crate::worktree::tilde;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -24,7 +26,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_detail(frame, app, detail);
     draw_footer(frame, app, footer);
     if app.show_help {
-        draw_help(frame);
+        draw_help(frame, app);
     }
     if let Some(prompt) = &app.prompt {
         draw_prompt(frame, prompt, &app.default_branch);
@@ -143,14 +145,15 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or(1);
     let worktrees = &app.worktrees;
     let items = app.prs.iter().map(|pr| {
-        let mut title = vec![
-            format!("#{:<number_width$} ", pr.number).dark_gray(),
-            Span::raw(pr.title.as_str()),
-            Span::raw(" "),
-        ];
+        let mut title = vec![format!("#{:<number_width$} ", pr.number).dark_gray()];
+        title.extend([Span::raw(pr.title.as_str()), Span::raw(" ")]);
         title.extend(label_chips(&pr.labels));
         let mut status = vec![Span::raw(" ".repeat(number_width + 2))];
-        for badge in status_badges(pr, worktrees.contains_key(&pr.head)) {
+        for badge in status_badges(
+            pr,
+            worktrees.contains_key(&pr.head),
+            claude_review_badge(app, pr),
+        ) {
             status.extend([badge, Span::raw("  ")]);
         }
         status.pop();
@@ -164,9 +167,24 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut app.list);
 }
 
+fn claude_review_badge(app: &App, pr: &PullRequest) -> Option<Span<'static>> {
+    app.claude_review_label.as_ref()?;
+    Some(if app.adding_claude_review.contains(&pr.number) {
+        "⟳ claude-review".yellow()
+    } else if pr.has_claude_review() {
+        "✓ claude-review".green()
+    } else {
+        "· no claude-review".dark_gray()
+    })
+}
+
 /// Short colored status words for a list row. States with nothing to act on
 /// (ready, no conflicts, auto-merge off) are left out.
-fn status_badges(pr: &PullRequest, has_worktree: bool) -> Vec<Span<'static>> {
+fn status_badges(
+    pr: &PullRequest,
+    has_worktree: bool,
+    claude_review: Option<Span<'static>>,
+) -> Vec<Span<'static>> {
     let badge = |glyph: Span<'static>, text: &str| {
         Span::styled(format!("{} {text}", glyph.content), glyph.style)
     };
@@ -191,6 +209,7 @@ fn status_badges(pr: &PullRequest, has_worktree: bool) -> Vec<Span<'static>> {
         CiState::Failed => format!("CI {} failed", pr.ci.failed),
     };
     badges.push(badge(ci_glyph(pr.ci), &ci));
+    badges.extend(claude_review);
     match pr.merge {
         Merge::Conflicts => badges.push(badge(merge_glyph(pr.merge), "conflicts")),
         Merge::Behind => badges.push(badge(merge_glyph(pr.merge), "behind base")),
@@ -224,7 +243,11 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner_width = area.width.saturating_sub(2);
 
     let worktree = app.worktree_for(pr).map(tilde);
-    let header = Paragraph::new(header_lines(pr, worktree)).wrap(Wrap { trim: false });
+    let mut lines = header_lines(pr, worktree);
+    if let Some(badge) = claude_review_badge(app, pr) {
+        lines.insert(2, Line::from(badge));
+    }
+    let header = Paragraph::new(lines).wrap(Wrap { trim: false });
     let header_height =
         (header.line_count(inner_width) as u16 + 2).min(area.height.saturating_sub(5));
     let [top, bottom] =
@@ -314,6 +337,12 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 ("c", "checkout"),
                 ("w", "worktree"),
             ];
+            if app
+                .selected_pr()
+                .is_some_and(|pr| app.can_add_claude_review(pr))
+            {
+                keys.push(("l", "add claude-review"));
+            }
             // Only offer removal where there's something to remove.
             if app
                 .selected_pr()
@@ -336,11 +365,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(hint, left);
 }
 
-fn draw_help(frame: &mut Frame) {
+fn draw_help(frame: &mut Frame, app: &App) {
     let key = |keys: &'static str, action: &'static str| {
         Line::from(vec![format!(" {keys:<14}").bold(), action.into()])
     };
-    let lines = vec![
+    let mut lines = vec![
         key("j/k  ↑/↓", "move selection"),
         key("g/G", "first / last"),
         key("J/K  PgUp/Dn", "scroll description"),
@@ -351,6 +380,9 @@ fn draw_help(frame: &mut Frame) {
         key("r", "refresh now (auto every 60s)"),
         key("q  Esc", "quit"),
     ];
+    if app.claude_review_label.is_some() {
+        lines.insert(5, key("l", "add claude-review label"));
+    }
     let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 3;
     let height = lines.len() as u16 + 2;
     let area = centered(frame.area(), width, height);
@@ -379,6 +411,10 @@ fn format_age(age: Duration) -> String {
 fn label_chips(labels: &[Label]) -> Vec<Span<'_>> {
     let mut spans = Vec::with_capacity(labels.len() * 2);
     for label in labels {
+        // This label has its own repository-gated status badge.
+        if label.name == CLAUDE_REVIEW_LABEL {
+            continue;
+        }
         let (r, g, b) = label.rgb;
         let luminance = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
         let fg = if luminance > 150.0 {
@@ -498,7 +534,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::app::tests::{app_with, sample_pr};
+    use crate::app::tests::{app_with, claude_label, sample_pr};
 
     fn render(app: &mut App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(150, 24)).unwrap();
@@ -528,6 +564,44 @@ mod tests {
     }
 
     #[test]
+    fn claude_feature_is_hidden_without_repository_label() {
+        let mut app = app_with(vec![sample_pr(1, "a")]);
+        assert!(!render(&mut app).contains("claude-review"));
+        app.show_help = true;
+        assert!(!render(&mut app).contains("claude-review"));
+    }
+
+    #[test]
+    fn claude_feature_shows_each_pr_status_and_only_offers_eligible_shortcut() {
+        let mut labeled = sample_pr(2, "b");
+        labeled.labels.push(claude_label());
+        let mut app = app_with(vec![sample_pr(1, "a"), labeled]);
+        app.claude_review_label = Some(claude_label());
+        let screen = render(&mut app);
+        assert!(screen.contains("#1 a  bug"), "{screen}");
+        assert!(screen.contains("#2 b  bug"), "{screen}");
+        assert!(screen.contains("⟳ CI 3/7  · no claude-review"), "{screen}");
+        assert!(screen.contains("⟳ CI 3/7  ✓ claude-review"), "{screen}");
+        assert!(screen.contains("l add claude-review"), "{screen}");
+
+        app.list.select(Some(1));
+        let screen = render(&mut app);
+        assert!(!screen.contains("l add claude-review"), "{screen}");
+        app.show_help = true;
+        assert!(render(&mut app).contains("add claude-review label"));
+
+        app.show_help = false;
+        app.list.select(Some(0));
+        app.adding_claude_review.insert(1);
+        let screen = render(&mut app);
+        assert!(screen.contains("⟳ CI 3/7  ⟳ claude-review"), "{screen}");
+        assert!(!screen.contains("l add claude-review"), "{screen}");
+
+        app.claude_review_label = None;
+        assert!(!render(&mut app).contains("claude-review"));
+    }
+
+    #[test]
     fn draft_replaces_needs_review_in_list() {
         let mut pr = sample_pr(7, "Draft");
         pr.is_draft = true;
@@ -541,7 +615,7 @@ mod tests {
         pr.merge = Merge::Clean;
         pr.auto_merge = AutoMerge::Off;
         pr.unresolved_threads = 1;
-        let text: Vec<_> = status_badges(&pr, false)
+        let text: Vec<_> = status_badges(&pr, false, None)
             .iter()
             .map(|s| s.content.to_string())
             .collect();
@@ -557,7 +631,7 @@ mod tests {
         pr.merge = Merge::Behind;
         pr.auto_merge = AutoMerge::Queued { position: Some(2) };
         pr.unresolved_threads = 0;
-        let text: Vec<_> = status_badges(&pr, false)
+        let text: Vec<_> = status_badges(&pr, false, None)
             .iter()
             .map(|s| s.content.to_string())
             .collect();

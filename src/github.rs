@@ -5,10 +5,15 @@ use std::process::{Command, Output, Stdio};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::model::{AutoMerge, Ci, CiState, Label, Merge, PullRequest, Review};
+use crate::model::{
+    AutoMerge, CLAUDE_REVIEW_LABEL, Ci, CiState, Label, Merge, PullRequest, Review,
+};
 
 const QUERY: &str = r#"
-query($q: String!) {
+query($q: String!, $owner: String!, $name: String!, $label: String!) {
+  repository(owner: $owner, name: $name) {
+    label(name: $label) { name color }
+  }
   search(query: $q, type: ISSUE, first: 100) {
     nodes {
       ... on PullRequest {
@@ -16,7 +21,7 @@ query($q: String!) {
         reviewDecision mergeable mergeStateStatus
         isInMergeQueue mergeQueueEntry { position }
         autoMergeRequest { enabledAt }
-        labels(first: 20) { nodes { name color } }
+        labels(first: 100) { nodes { name color } }
         latestReviews(first: 50) { nodes { state } }
         reviewThreads(first: 100) { nodes { isResolved } }
         commits(last: 1) { nodes { commit { statusCheckRollup {
@@ -131,7 +136,10 @@ pub fn current_repo() -> Result<Repo> {
 }
 
 /// Fetches the open pull requests authored by the authenticated user.
-pub fn fetch_my_prs(repo: &str) -> Result<Vec<PullRequest>> {
+pub fn fetch_my_prs(repo: &str) -> Result<PrSnapshot> {
+    let (owner, name) = repo
+        .split_once('/')
+        .context("expected owner/name repository")?;
     let search = format!("repo:{repo} is:pr is:open author:@me sort:updated-desc");
     let output = gh(&[
         "api",
@@ -140,8 +148,28 @@ pub fn fetch_my_prs(repo: &str) -> Result<Vec<PullRequest>> {
         &format!("query={QUERY}"),
         "-f",
         &format!("q={search}"),
+        "-f",
+        &format!("owner={owner}"),
+        "-f",
+        &format!("name={name}"),
+        "-f",
+        &format!("label={CLAUDE_REVIEW_LABEL}"),
     ])?;
     parse_response(&output.stdout)
+}
+
+/// Adds an existing repository label; `gh pr edit` does not create labels.
+pub fn add_claude_review(repo: &str, number: u64) -> Result<()> {
+    gh(&[
+        "pr",
+        "edit",
+        &number.to_string(),
+        "--repo",
+        repo,
+        "--add-label",
+        CLAUDE_REVIEW_LABEL,
+    ])?;
+    Ok(())
 }
 
 pub enum Checkout {
@@ -192,16 +220,31 @@ pub fn open_in_browser(repo: &str, number: u64) -> Result<()> {
     Ok(())
 }
 
-fn parse_response(json: &[u8]) -> Result<Vec<PullRequest>> {
+pub struct PrSnapshot {
+    pub prs: Vec<PullRequest>,
+    pub claude_review_label: Option<Label>,
+}
+
+fn parse_response(json: &[u8]) -> Result<PrSnapshot> {
     let response: Response =
         serde_json::from_slice(json).context("unexpected response from GitHub")?;
-    Ok(response
+    let claude_review_label = response
+        .data
+        .repository
+        .label
+        .map(Label::from)
+        .filter(|label| label.name == CLAUDE_REVIEW_LABEL);
+    let prs = response
         .data
         .search
         .nodes
         .into_iter()
         .map(PullRequest::from)
-        .collect())
+        .collect();
+    Ok(PrSnapshot {
+        prs,
+        claude_review_label,
+    })
 }
 
 #[derive(Deserialize)]
@@ -211,7 +254,13 @@ struct Response {
 
 #[derive(Deserialize)]
 struct Data {
+    repository: RawRepository,
     search: Nodes<RawPr>,
+}
+
+#[derive(Deserialize)]
+struct RawRepository {
+    label: Option<RawLabel>,
 }
 
 #[derive(Deserialize)]
@@ -430,6 +479,42 @@ fn clean_body(body: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn detects_repository_label_even_with_no_open_prs() {
+        for (label, expected) in [
+            (serde_json::Value::Null, false),
+            (
+                serde_json::json!({"name": "claude-review", "color": "aabbcc"}),
+                true,
+            ),
+            (
+                serde_json::json!({"name": "claude-review-other", "color": "aabbcc"}),
+                false,
+            ),
+        ] {
+            let response = serde_json::json!({"data": {
+                "repository": {"label": label}, "search": {"nodes": []}
+            }});
+            let snapshot = parse_response(response.to_string().as_bytes()).unwrap();
+            assert_eq!(snapshot.claude_review_label.is_some(), expected);
+            assert!(snapshot.prs.is_empty());
+        }
+    }
+
+    #[test]
+    fn recognizes_only_the_claude_review_label_on_a_pr() {
+        assert!(
+            !pr(r#""labels": {"nodes": [
+            {"name": "claude-review-other", "color": "aabbcc"}]}"#)
+            .has_claude_review()
+        );
+        assert!(
+            pr(r#""labels": {"nodes": [
+            {"name": "claude-review", "color": "aabbcc"}]}"#)
+            .has_claude_review()
+        );
+    }
+
     /// Builds a PR from a baseline response node with `fields` overriding it.
     fn pr(fields: &str) -> PullRequest {
         let mut node: serde_json::Value = serde_json::from_str(
@@ -449,9 +534,12 @@ mod tests {
         for (key, value) in overrides.as_object().unwrap() {
             node[key] = value.clone();
         }
-        let response = serde_json::json!({"data": {"search": {"nodes": [node]}}});
+        let response = serde_json::json!({"data": {
+            "repository": {"label": null}, "search": {"nodes": [node]}
+        }});
         parse_response(response.to_string().as_bytes())
             .unwrap()
+            .prs
             .remove(0)
     }
 
