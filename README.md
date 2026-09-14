@@ -13,9 +13,9 @@ Requires the [GitHub CLI](https://cli.github.com/), logged in with `gh auth logi
 cargo install --path .
 ```
 
-This installs both `code-flow` and `cl`. Run either command from inside a clone
+This installs both `code-flow` and `cf`. Run either command from inside a clone
 of a GitHub repository; both launch the same application. For local development,
-plain `cargo run` launches `code-flow`, and `cargo run --bin cl` launches `cl`.
+plain `cargo run` launches `code-flow`, and `cargo run --bin cf` launches `cf`.
 
 If you have [just](https://just.systems), the [justfile](justfile) wraps the
 steps below: `just install` installs both commands, `just install-tools` installs

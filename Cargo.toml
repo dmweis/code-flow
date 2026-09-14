@@ -11,8 +11,8 @@ name = "code-flow"
 path = "src/main.rs"
 
 [[bin]]
-name = "cl"
-path = "src/bin/cl.rs"
+name = "cf"
+path = "src/bin/cf.rs"
 
 [dependencies]
 anyhow = "1.0.104"
