@@ -1,8 +1,7 @@
-//! Opens a PR in its own worktrunk worktree and, when running inside Herdr, in
-//! a Herdr workspace there. Both tools are optional: a missing tool is
-//! reported to the user instead of breaking the app.
+//! Opens a PR, or a new branch, in its own worktrunk worktree and, when
+//! running inside Herdr, in a Herdr workspace there. Both tools are optional:
+//! a missing tool is reported to the user instead of breaking the app.
 
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
@@ -13,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::github::git_in;
+use crate::model::{Progress, Worktree, WorktreeStatus};
 
 pub struct OpenedWorktree {
     pub path: String,
@@ -37,28 +37,82 @@ pub enum OpenOutcome {
 }
 
 impl OpenedWorktree {
-    pub fn summary(&self, number: u64) -> String {
+    /// Describes the outcome for `subject`, e.g. "PR #3" or a branch name.
+    pub fn summary(&self, subject: &str) -> String {
         let path = tilde(&self.path);
         match self.workspace {
-            Workspace::Opened => format!("Opened PR #{number} in a Herdr workspace at {path}"),
-            Workspace::AlreadyOpen => format!("Switched to the Herdr workspace for PR #{number}"),
+            Workspace::Opened => format!("Opened {subject} in a Herdr workspace at {path}"),
+            Workspace::AlreadyOpen => format!("Switched to the Herdr workspace for {subject}"),
             Workspace::NotInHerdr => {
-                format!(
-                    "PR #{number} worktree at {path} (not inside Herdr, so no workspace opened)"
-                )
+                format!("{subject} worktree at {path} (not inside Herdr, so no workspace opened)")
             }
             Workspace::HerdrMissing => {
                 format!(
-                    "PR #{number} worktree at {path} (herdr not installed, so no workspace opened)"
+                    "{subject} worktree at {path} (herdr not installed, so no workspace opened)"
                 )
             }
         }
     }
 }
 
+/// The prefix for new branches: the lowercased user name and a slash, or
+/// nothing if the user name can't be read.
+pub fn branch_prefix() -> String {
+    run("whoami", &[])
+        .ok()
+        .flatten()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_lowercase()
+        })
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("{name}/"))
+        .unwrap_or_default()
+}
+
+/// Turns free text into a branch name: lowercase letters and digits joined by
+/// single dashes. Spaces and `-_/.` separate words; anything else is dropped.
+pub fn slugify(text: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(c.to_ascii_lowercase());
+        } else if c.is_whitespace() || "-_/.".contains(c) {
+            pending_dash = true;
+        }
+    }
+    slug
+}
+
+/// Creates `branch` from the freshly fetched default branch in a new worktree
+/// and opens it. Fails if the branch already exists.
+pub fn create(branch: &str, default_branch: &str) -> Result<OpenedWorktree> {
+    git_in(".", &["fetch", "origin", default_branch])?;
+    let base = format!("origin/{default_branch}");
+    let path = wt_switch(&["--create", branch, "--base", &base])?;
+    let workspace = open_workspace(&path, branch)?;
+    Ok(OpenedWorktree { path, workspace })
+}
+
+/// Opens the Herdr workspace for an existing worktree.
+pub fn open_branch(branch: &str, path: &str) -> Result<OpenedWorktree> {
+    let workspace = open_workspace(path, branch)?;
+    Ok(OpenedWorktree {
+        path: path.to_owned(),
+        workspace,
+    })
+}
+
 /// Checks out the PR into a worktree (reusing an existing one) and opens it.
 pub fn open_pr(number: u64, branch: &str) -> Result<OpenOutcome> {
-    let path = switch_worktree(number)?;
+    let path = wt_switch(&[&format!("pr:{number}")])?;
     if same_path(&path, &main_worktree()?) {
         return Ok(OpenOutcome::InMainCheckout {
             branch: branch.to_owned(),
@@ -90,13 +144,22 @@ pub fn move_to_worktree(
     open_pr(number, branch)
 }
 
-/// Linked worktrees by branch name. The main checkout is left out: it's where
-/// you work, not a PR's worktree.
-pub fn list_worktrees() -> Result<HashMap<String, String>> {
-    Ok(parse_worktrees(&git_in(
-        ".",
-        &["worktree", "list", "--porcelain"],
-    )?))
+/// Linked worktrees with a branch checked out, newest commit first. The main
+/// checkout is left out: it's where you work, not a PR's worktree. Without
+/// worktrunk, falls back to git and reports no status.
+pub fn list_worktrees() -> Result<Vec<Worktree>> {
+    let from_wt = run("wt", &["list", "--format", "json"])
+        .ok()
+        .flatten()
+        .filter(|output| output.status.success())
+        .and_then(|output| parse_wt_list(&output.stdout).ok());
+    let mut worktrees = match from_wt {
+        Some(worktrees) => worktrees,
+        None => parse_worktrees(&git_in(".", &["worktree", "list", "--porcelain"])?),
+    };
+    // Option orders None first, so reversing puts undated worktrees last.
+    worktrees.sort_by(|a, b| b.committed_at.cmp(&a.committed_at));
+    Ok(worktrees)
 }
 
 /// Removes the PR's worktree with worktrunk, which refuses if it has
@@ -132,12 +195,13 @@ fn run(program: &str, args: &[&str]) -> Result<Option<Output>> {
     }
 }
 
-fn switch_worktree(number: u64) -> Result<String> {
+/// Runs `wt switch` with `args`, returning the worktree's path.
+fn wt_switch(args: &[&str]) -> Result<String> {
     // Without a terminal, worktrunk refuses to run unapproved project hooks
     // rather than prompting. Deliberately no --yes: that would run whatever
     // hooks the repository's config asks for.
-    let pr = format!("pr:{number}");
-    let Some(output) = run("wt", &["switch", &pr, "--no-cd", "--format", "json"])? else {
+    let args = [&["switch"][..], args, &["--no-cd", "--format", "json"]].concat();
+    let Some(output) = run("wt", &args)? else {
         bail!("worktrunk (wt) is not installed; see https://worktrunk.dev");
     };
     if !output.status.success() {
@@ -178,7 +242,7 @@ fn main_worktree() -> Result<String> {
         .context("`git worktree list` returned no worktrees")
 }
 
-fn parse_worktrees(porcelain: &str) -> HashMap<String, String> {
+fn parse_worktrees(porcelain: &str) -> Vec<Worktree> {
     porcelain
         .split("\n\n")
         .skip(1)
@@ -187,9 +251,57 @@ fn parse_worktrees(porcelain: &str) -> HashMap<String, String> {
             let branch = entry
                 .lines()
                 .find_map(|l| l.strip_prefix("branch refs/heads/"))?;
-            Some((branch.to_owned(), path.to_owned()))
+            Some(Worktree {
+                branch: branch.to_owned(),
+                path: path.to_owned(),
+                subject: None,
+                committed_at: None,
+                status: None,
+            })
         })
         .collect()
+}
+
+fn parse_wt_list(json: &[u8]) -> Result<Vec<Worktree>> {
+    let list: WtList = serde_json::from_slice(json).context("unexpected output from `wt list`")?;
+    Ok(list
+        .items
+        .into_iter()
+        .filter_map(|item| {
+            let worktree = item.worktree.filter(|worktree| !worktree.main)?;
+            let changes = worktree.changes.unwrap_or_default();
+            let (subject, committed_at) = item
+                .head
+                .map(|head| (head.subject, head.committed_at))
+                .unwrap_or_default();
+            Some(Worktree {
+                branch: item.branch?,
+                path: worktree.path,
+                subject,
+                committed_at,
+                status: Some(WorktreeStatus {
+                    uncommitted: changes.staged
+                        || changes.modified
+                        || changes.untracked
+                        || changes.renamed
+                        || changes.deleted
+                        || changes.conflicted == Some(true),
+                    progress: item.default_branch.and_then(progress),
+                }),
+            })
+        })
+        .collect())
+}
+
+fn progress(default_branch: WtDefaultBranch) -> Option<Progress> {
+    // Integration is checked first: a branch merged with a merge commit is no
+    // longer ahead, but it isn't empty either.
+    Some(match (default_branch.integration, default_branch.ahead?) {
+        (Some(integration), _) if integration.reason == "same_commit" => Progress::Empty,
+        (Some(_), _) => Progress::Merged,
+        (None, 0) => Progress::Empty,
+        (None, ahead) => Progress::Ahead(ahead),
+    })
 }
 
 /// Compares paths after resolving symlinks, e.g. macOS's /tmp -> /private/tmp.
@@ -300,6 +412,60 @@ struct WtSwitch {
 }
 
 #[derive(Deserialize)]
+struct WtList {
+    items: Vec<WtItem>,
+}
+
+#[derive(Deserialize)]
+struct WtItem {
+    /// `None` for a detached HEAD.
+    branch: Option<String>,
+    head: Option<WtHead>,
+    /// `None` for rows that are only a branch.
+    worktree: Option<WtWorktree>,
+    /// `None` on the default branch itself.
+    default_branch: Option<WtDefaultBranch>,
+}
+
+#[derive(Deserialize)]
+struct WtHead {
+    subject: Option<String>,
+    committed_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WtWorktree {
+    path: String,
+    main: bool,
+    changes: Option<WtChanges>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct WtChanges {
+    staged: bool,
+    modified: bool,
+    untracked: bool,
+    renamed: bool,
+    deleted: bool,
+    conflicted: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct WtDefaultBranch {
+    /// `None` when the branch shares no history with the default branch.
+    ahead: Option<u32>,
+    /// Absent when not integrated, null when uncommitted changes skipped the
+    /// check; both read as not integrated.
+    integration: Option<WtIntegration>,
+}
+
+#[derive(Deserialize)]
+struct WtIntegration {
+    reason: String,
+}
+
+#[derive(Deserialize)]
 struct HerdrResponse<T> {
     result: T,
 }
@@ -405,6 +571,103 @@ mod tests {
             worktree /src/repo.detached\nHEAD 4c27a2c\ndetached\n";
         let worktrees = parse_worktrees(porcelain);
         assert_eq!(worktrees.len(), 1);
-        assert_eq!(worktrees["mock/feature"], "/src/repo.feature");
+        assert_eq!(worktrees[0].branch, "mock/feature");
+        assert_eq!(worktrees[0].path, "/src/repo.feature");
+        assert_eq!(worktrees[0].status, None);
+    }
+
+    #[test]
+    fn parses_wt_list_json() {
+        // Trimmed from wt 0.77.0: the main checkout, a squash-merged branch,
+        // a fresh branch with untracked files, a branch with commits, and a
+        // detached worktree.
+        let json = br#"{"schema":2,"repo":{"default_branch":"main"},"items":[
+            {"branch":"main","head":{"subject":"init","committed_at":"2026-09-14T00:32:20Z"},
+             "worktree":{"path":"/src/repo","main":true,"changes":{"staged":false,"modified":false,"untracked":false,"renamed":false,"deleted":false,"conflicted":false}}},
+            {"branch":"dweis/merged","head":{"subject":"wip","committed_at":"2026-09-14T00:35:09Z"},
+             "worktree":{"path":"/src/repo.dweis-merged","main":false,"changes":{"staged":false,"modified":false,"untracked":false,"renamed":false,"deleted":false,"conflicted":false}},
+             "default_branch":{"ahead":1,"behind":1,"orphan":false,"integration":{"reason":"patch_id_match"}}},
+            {"branch":"dweis/fresh","head":{"subject":"init","committed_at":"2026-09-14T00:32:20Z"},
+             "worktree":{"path":"/src/repo.dweis-fresh","main":false,"changes":{"staged":false,"modified":false,"untracked":true,"renamed":false,"deleted":false,"conflicted":false}},
+             "default_branch":{"ahead":0,"behind":0,"orphan":false,"integration":null}},
+            {"branch":"dweis/busy","head":{"subject":"Add retry","committed_at":"2026-09-13T10:00:00Z"},
+             "worktree":{"path":"/src/repo.dweis-busy","main":false,"changes":null},
+             "default_branch":{"ahead":3,"behind":0,"orphan":false}},
+            {"branch":null,"head":{"subject":"x","committed_at":"2026-09-13T10:00:00Z"},
+             "worktree":{"path":"/src/repo.detached","main":false}}]}"#;
+        let worktrees = parse_wt_list(json).unwrap();
+        let summary: Vec<_> = worktrees
+            .iter()
+            .map(|w| (w.branch.as_str(), w.status.unwrap()))
+            .collect();
+        let status = |uncommitted, progress| WorktreeStatus {
+            uncommitted,
+            progress: Some(progress),
+        };
+        assert_eq!(
+            summary,
+            [
+                ("dweis/merged", status(false, Progress::Merged)),
+                ("dweis/fresh", status(true, Progress::Empty)),
+                ("dweis/busy", status(false, Progress::Ahead(3))),
+            ]
+        );
+        assert_eq!(worktrees[2].subject.as_deref(), Some("Add retry"));
+        assert_eq!(worktrees[2].path, "/src/repo.dweis-busy");
+    }
+
+    #[test]
+    fn integration_decides_progress_before_ahead_count() {
+        let progress_of = |ahead, reason: Option<&str>| {
+            progress(WtDefaultBranch {
+                ahead,
+                integration: reason.map(|reason| WtIntegration {
+                    reason: reason.into(),
+                }),
+            })
+        };
+        assert_eq!(
+            progress_of(Some(0), Some("same_commit")),
+            Some(Progress::Empty)
+        );
+        // Merged with a merge commit: nothing ahead, but not empty either.
+        assert_eq!(
+            progress_of(Some(0), Some("ancestor")),
+            Some(Progress::Merged)
+        );
+        assert_eq!(progress_of(Some(0), None), Some(Progress::Empty));
+        assert_eq!(progress_of(Some(2), None), Some(Progress::Ahead(2)));
+        assert_eq!(progress_of(None, None), None);
+    }
+
+    #[test]
+    fn slugifies_branch_names() {
+        assert_eq!(
+            slugify(r#"Fix Bob's "flaky" CI_retry"#),
+            "fix-bobs-flaky-ci-retry"
+        );
+        assert_eq!(slugify("  --Add  v1.2 / docs--  "), "add-v1-2-docs");
+        assert_eq!(slugify("Café résumé!"), "caf-rsum");
+        assert_eq!(slugify("?!'\""), "");
+    }
+
+    #[test]
+    fn summarizes_opened_worktree_for_any_subject() {
+        let opened = OpenedWorktree {
+            path: "/src/repo.x".into(),
+            workspace: Workspace::Opened,
+        };
+        assert_eq!(
+            opened.summary("PR #3"),
+            "Opened PR #3 in a Herdr workspace at /src/repo.x"
+        );
+        let opened = OpenedWorktree {
+            workspace: Workspace::NotInHerdr,
+            ..opened
+        };
+        assert_eq!(
+            opened.summary("dweis/x"),
+            "dweis/x worktree at /src/repo.x (not inside Herdr, so no workspace opened)"
+        );
     }
 }

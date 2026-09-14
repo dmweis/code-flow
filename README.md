@@ -24,9 +24,9 @@ skills, and `just install-all` does all three. Run `just` to list every recipe.
 
 ### Optional: worktrunk and Herdr
 
-The `w` and `W` keys use [worktrunk](https://worktrunk.dev) (`wt`) to manage
-PR worktrees, and [Herdr](https://herdr.dev) to open a workspace for each one.
-Both are optional; everything else works without them.
+The `w`, `W` and `n` keys use [worktrunk](https://worktrunk.dev) (`wt`) to
+manage worktrees, and [Herdr](https://herdr.dev) to open a workspace for each
+one. Both are optional; everything else works without them.
 
 #### macOS
 
@@ -98,6 +98,29 @@ to add the label to the selected PR. While the request runs, the tag shows
 The tag and shortcut are hidden and disabled in repositories without this
 label. Label availability is checked on every refresh.
 
+## New branches and local worktrees
+
+Press `n` to start a new change. Type a name; it becomes a branch named
+after your user name, e.g. `Fix "flaky" CI` becomes `dweis/fix-flaky-ci`.
+code-flow fetches the default branch from `origin`, creates the branch from
+it in a new worktree, and opens a Herdr workspace there with a shell. It
+fails if the branch already exists.
+
+Every linked worktree is listed under **Local worktrees** below your PRs:
+new branches, your PRs' worktrees, and worktrees left over from merged PRs.
+If the branch is one of your open PRs, the row shows that PR's number and
+title. With worktrunk installed, each also shows:
+
+| Words | Meaning |
+| --- | --- |
+| `● uncommitted` | uncommitted changes in the worktree |
+| `◌ empty` | no commits of its own yet |
+| `↑ 3 commits` | commits the default branch doesn't have |
+| `✓ merged` | its changes are already in the default branch |
+
+`w` reopens a local worktree's Herdr workspace, and `W` removes it. Removing
+deletes the branch too if it's empty or merged, and keeps it otherwise.
+
 ## Keys
 
 | Key | Action |
@@ -108,8 +131,9 @@ label. Label availability is checked on every refresh.
 | `o`, `Enter` | open PR in browser |
 | `l` | add `claude-review` to the selected PR, if the repository defines the label and the PR does not already have it |
 | `c` | `gh pr checkout` the selected PR; if your local branch has diverged (e.g. the PR was rebased), offers to reset it |
-| `w` | open the PR in a [worktrunk](https://worktrunk.dev) worktree and, inside [Herdr](https://herdr.dev), a Herdr workspace there (both optional); if the PR's branch is checked out in your main checkout, offers to move it to a worktree |
-| `W` | remove the PR's worktree and close its Herdr workspace, after confirming |
+| `w` | open the PR in a [worktrunk](https://worktrunk.dev) worktree and, inside [Herdr](https://herdr.dev), a Herdr workspace there (both optional); if the PR's branch is checked out in your main checkout, offers to move it to a worktree. On a local worktree, reopens its Herdr workspace |
+| `W` | remove the selected worktree and close its Herdr workspace, after confirming |
+| `n` | create a new branch in its own worktree and Herdr workspace; see [New branches](#new-branches-and-local-worktrees) |
 | `r` | refresh (also automatic every 60s) |
 | `?` | key bindings |
 | `q`, `Esc` | quit |

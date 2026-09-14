@@ -11,9 +11,9 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::widgets::ListState;
 
 use crate::github::{self, Checkout, PrSnapshot, Repo};
-use crate::model::{Label, PullRequest};
+use crate::model::{Label, Progress, PullRequest, Worktree};
 use crate::ui;
-use crate::worktree::{self, OpenOutcome};
+use crate::worktree::{self, OpenOutcome, OpenedWorktree};
 
 const TICK: Duration = Duration::from_millis(200);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -21,13 +21,29 @@ const FLASH_DURATION: Duration = Duration::from_secs(5);
 
 /// Results of background work, sent back to the event loop.
 enum Msg {
-    Prs(Result<PrSnapshot>, HashMap<String, String>),
+    Prs(Result<PrSnapshot>, Vec<Worktree>),
     ClaudeReviewAdded(u64, Label, Result<()>),
-    Worktrees(Result<HashMap<String, String>>),
+    Worktrees(Result<Vec<Worktree>>),
     CheckedOut(u64, Result<Checkout>),
     Opened(Result<()>),
     OpenedWorktree(u64, Result<OpenOutcome>),
-    RemovedWorktree(u64, Result<bool>),
+    /// A new or existing local branch opened in its worktree.
+    OpenedBranch(String, Result<OpenedWorktree>),
+    /// Names what lost its worktree: "PR #3" or a branch.
+    RemovedWorktree(String, Result<bool>),
+}
+
+/// A selectable row: one of your open PRs, or a local worktree without one.
+pub enum Row<'a> {
+    Pr(&'a PullRequest),
+    Local(&'a Worktree),
+}
+
+/// Identifies a row across refreshes, which can reorder or remove rows.
+#[derive(Clone, PartialEq, Eq)]
+enum RowId {
+    Pr(u64),
+    Local(String),
 }
 
 pub struct Flash {
@@ -53,6 +69,13 @@ pub enum Prompt {
         branch: String,
         path: String,
     },
+    /// A local worktree, whose branch isn't one of your open PRs.
+    RemoveLocal {
+        branch: String,
+        path: String,
+        /// Decides whether worktrunk deletes the branch too.
+        progress: Option<Progress>,
+    },
 }
 
 pub struct App {
@@ -63,12 +86,19 @@ pub struct App {
     pub adding_claude_review: HashSet<u64>,
     /// Successful edits that an already-running refresh may not have seen.
     claude_review_updates: HashMap<u64, Label>,
-    /// Linked worktree paths by branch name.
-    pub worktrees: HashMap<String, String>,
+    /// Linked worktrees, newest commit first.
+    pub worktrees: Vec<Worktree>,
+    /// The selection among PR rows. `local_list` holds it among local rows;
+    /// at most one of the two has a selection.
     pub list: ListState,
+    pub local_list: ListState,
     pub detail_scroll: u16,
     pub show_help: bool,
     pub prompt: Option<Prompt>,
+    /// Prepended to new branch names, e.g. `dweis/`.
+    pub branch_prefix: String,
+    /// What's typed so far while the new branch input is open.
+    pub new_branch: Option<String>,
     /// When the in-flight fetch started, if one is running.
     pub loading_since: Option<Instant>,
     pub last_success: Option<Instant>,
@@ -83,6 +113,7 @@ pub struct App {
 pub fn run(terminal: &mut DefaultTerminal, repo: Repo) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let mut app = App::new(repo, tx);
+    app.branch_prefix = worktree::branch_prefix();
     app.refresh();
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
@@ -109,11 +140,14 @@ impl App {
             claude_review_label: None,
             adding_claude_review: HashSet::new(),
             claude_review_updates: HashMap::new(),
-            worktrees: HashMap::new(),
+            worktrees: Vec::new(),
             list: ListState::default(),
+            local_list: ListState::default(),
             detail_scroll: 0,
             show_help: false,
             prompt: None,
+            branch_prefix: String::new(),
+            new_branch: None,
             loading_since: None,
             last_success: None,
             last_attempt: None,
@@ -124,12 +158,34 @@ impl App {
         }
     }
 
+    pub fn selected(&self) -> Option<Row<'_>> {
+        if let Some(i) = self.list.selected() {
+            return self.prs.get(i).map(Row::Pr);
+        }
+        let i = self.local_list.selected()?;
+        self.worktrees.get(i).map(Row::Local)
+    }
+
     pub fn selected_pr(&self) -> Option<&PullRequest> {
         self.list.selected().and_then(|i| self.prs.get(i))
     }
 
     pub fn worktree_for(&self, pr: &PullRequest) -> Option<&str> {
-        self.worktrees.get(&pr.head).map(String::as_str)
+        self.worktrees
+            .iter()
+            .find(|worktree| worktree.branch == pr.head)
+            .map(|worktree| worktree.path.as_str())
+    }
+
+    /// Your open PR for the worktree's branch, if there is one.
+    pub fn pr_for(&self, worktree: &Worktree) -> Option<&PullRequest> {
+        self.prs.iter().find(|pr| pr.head == worktree.branch)
+    }
+
+    /// The branch the new branch input would create, if it names one.
+    pub fn new_branch_name(&self) -> Option<String> {
+        let slug = worktree::slugify(self.new_branch.as_deref()?);
+        (!slug.is_empty()).then(|| format!("{}{slug}", self.branch_prefix))
     }
 
     pub fn can_add_claude_review(&self, pr: &PullRequest) -> bool {
@@ -216,7 +272,7 @@ impl App {
             Msg::Prs(result, worktrees) => {
                 self.loading_since = None;
                 self.last_attempt = Some(Instant::now());
-                self.worktrees = worktrees;
+                self.set_worktrees(worktrees);
                 match result {
                     Ok(mut snapshot) => {
                         for pr in &mut snapshot.prs {
@@ -259,7 +315,7 @@ impl App {
                     ),
                 }
             }
-            Msg::Worktrees(Ok(worktrees)) => self.worktrees = worktrees,
+            Msg::Worktrees(Ok(worktrees)) => self.set_worktrees(worktrees),
             Msg::Worktrees(Err(_)) => {}
             Msg::CheckedOut(number, Ok(Checkout::Done(output))) => {
                 let text = match output.is_empty() {
@@ -273,7 +329,11 @@ impl App {
                 self.prompt = Some(Prompt::ForceCheckout { number, branch });
             }
             Msg::OpenedWorktree(number, Ok(OpenOutcome::Opened(opened))) => {
-                self.set_flash(opened.summary(number), false);
+                self.set_flash(opened.summary(&format!("PR #{number}")), false);
+                self.refresh_worktrees();
+            }
+            Msg::OpenedBranch(branch, Ok(opened)) => {
+                self.set_flash(opened.summary(&branch), false);
                 self.refresh_worktrees();
             }
             Msg::OpenedWorktree(number, Ok(OpenOutcome::InMainCheckout { branch, path })) => {
@@ -284,12 +344,12 @@ impl App {
                     main_path: path,
                 });
             }
-            Msg::RemovedWorktree(number, Ok(closed_workspace)) => {
+            Msg::RemovedWorktree(subject, Ok(closed_workspace)) => {
                 let text = match closed_workspace {
-                    true => format!(
-                        "Removed the worktree for PR #{number} and closed its Herdr workspace"
-                    ),
-                    false => format!("Removed the worktree for PR #{number}"),
+                    true => {
+                        format!("Removed the worktree for {subject} and closed its Herdr workspace")
+                    }
+                    false => format!("Removed the worktree for {subject}"),
                 };
                 self.set_flash(text, false);
                 self.refresh_worktrees();
@@ -297,6 +357,7 @@ impl App {
             Msg::CheckedOut(_, Err(err))
             | Msg::Opened(Err(err))
             | Msg::OpenedWorktree(_, Err(err))
+            | Msg::OpenedBranch(_, Err(err))
             | Msg::RemovedWorktree(_, Err(err)) => {
                 self.set_flash(format!("{err:#}"), true);
             }
@@ -304,29 +365,79 @@ impl App {
         }
     }
 
-    /// Replaces the PR list, keeping the same PR selected if it's still open.
+    /// Replaces the PR list, keeping the same row selected if it's still there.
     fn set_prs(&mut self, prs: Vec<PullRequest>) {
-        let previous = self.selected_pr().map(|pr| pr.number);
-        let old_index = self.list.selected().unwrap_or(0);
+        let (previous, old_index) = (self.selected_id(), self.selected_index().unwrap_or(0));
         self.prs = prs;
         self.load_error = None;
         self.last_success = Some(Instant::now());
+        self.restore_selection(previous, old_index);
+    }
+
+    fn set_worktrees(&mut self, worktrees: Vec<Worktree>) {
+        let (previous, old_index) = (self.selected_id(), self.selected_index().unwrap_or(0));
+        self.worktrees = worktrees;
+        self.restore_selection(previous, old_index);
+    }
+
+    /// Selects `previous` again after the rows changed, or failing that,
+    /// whatever is now at its position.
+    fn restore_selection(&mut self, previous: Option<RowId>, old_index: usize) {
+        let count = self.row_count();
         let index = previous
-            .and_then(|number| self.prs.iter().position(|pr| pr.number == number))
-            .or_else(|| (!self.prs.is_empty()).then(|| old_index.min(self.prs.len() - 1)));
-        self.list.select(index);
-        if self.selected_pr().map(|pr| pr.number) != previous {
+            .as_ref()
+            .and_then(|id| self.index_of(id))
+            .or_else(|| (count > 0).then(|| old_index.min(count - 1)));
+        self.set_selection(index);
+        if self.selected_id() != previous {
             self.detail_scroll = 0;
         }
     }
 
+    /// PR rows come first, then local rows.
+    fn row_count(&self) -> usize {
+        self.prs.len() + self.worktrees.len()
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        self.list
+            .selected()
+            .or_else(|| self.local_list.selected().map(|i| i + self.prs.len()))
+    }
+
+    fn selected_id(&self) -> Option<RowId> {
+        Some(match self.selected()? {
+            Row::Pr(pr) => RowId::Pr(pr.number),
+            Row::Local(worktree) => RowId::Local(worktree.branch.clone()),
+        })
+    }
+
+    fn index_of(&self, id: &RowId) -> Option<usize> {
+        match id {
+            RowId::Pr(number) => self.prs.iter().position(|pr| pr.number == *number),
+            RowId::Local(branch) => self
+                .worktrees
+                .iter()
+                .position(|worktree| &worktree.branch == branch)
+                .map(|i| i + self.prs.len()),
+        }
+    }
+
+    fn set_selection(&mut self, index: Option<usize>) {
+        let prs = self.prs.len();
+        self.list.select(index.filter(|&i| i < prs));
+        self.local_list
+            .select(index.filter(|&i| i >= prs).map(|i| i - prs));
+    }
+
     fn select(&mut self, index: usize) {
-        if self.prs.is_empty() {
+        let count = self.row_count();
+        if count == 0 {
             return;
         }
-        let index = index.min(self.prs.len() - 1);
-        if self.list.selected() != Some(index) {
-            self.list.select(Some(index));
+        let index = index.min(count - 1);
+        if self.selected_index() != Some(index) {
+            self.set_selection(Some(index));
             self.detail_scroll = 0;
         }
     }
@@ -340,11 +451,15 @@ impl App {
             self.on_prompt_key(key, prompt);
             return;
         }
+        if let Some(text) = self.new_branch.take() {
+            self.on_new_branch_key(key, text);
+            return;
+        }
         if self.show_help {
             self.show_help = false;
             return;
         }
-        let current = self.list.selected().unwrap_or(0);
+        let current = self.selected_index().unwrap_or(0);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.select(current + 1),
@@ -371,17 +486,27 @@ impl App {
                     self.spawn(move || Msg::CheckedOut(number, github::checkout(&repo, number)));
                 }
             }
-            KeyCode::Char('w') => {
-                if let Some(pr) = self.selected_pr() {
+            KeyCode::Char('n') => self.new_branch = Some(String::new()),
+            KeyCode::Char('w') => match self.selected() {
+                Some(Row::Pr(pr)) => {
                     let (number, branch) = (pr.number, pr.head.clone());
                     self.set_flash(format!("Opening PR #{number} in a worktree…"), false);
                     self.spawn(move || {
                         Msg::OpenedWorktree(number, worktree::open_pr(number, &branch))
                     });
                 }
-            }
-            KeyCode::Char('W') => {
-                if let Some(pr) = self.selected_pr() {
+                Some(Row::Local(local)) => {
+                    let (branch, path) = (local.branch.clone(), local.path.clone());
+                    self.set_flash(format!("Opening {branch}…"), false);
+                    self.spawn(move || {
+                        let result = worktree::open_branch(&branch, &path);
+                        Msg::OpenedBranch(branch, result)
+                    });
+                }
+                None => {}
+            },
+            KeyCode::Char('W') => match self.selected() {
+                Some(Row::Pr(pr)) => {
                     let (number, branch) = (pr.number, pr.head.clone());
                     match self.worktree_for(pr).map(str::to_owned) {
                         Some(path) => {
@@ -394,9 +519,54 @@ impl App {
                         None => self.set_flash(format!("PR #{number} has no worktree"), false),
                     }
                 }
+                Some(Row::Local(local)) => {
+                    self.prompt = Some(Prompt::RemoveLocal {
+                        branch: local.branch.clone(),
+                        path: local.path.clone(),
+                        progress: local.status.and_then(|status| status.progress),
+                    })
+                }
+                None => {}
+            },
+            _ => {}
+        }
+    }
+
+    fn on_new_branch_key(&mut self, key: KeyEvent, mut text: String) {
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Enter => {
+                let slug = worktree::slugify(&text);
+                if !slug.is_empty() {
+                    self.create_branch(format!("{}{slug}", self.branch_prefix));
+                    return;
+                }
+            }
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                text.push(c)
             }
             _ => {}
         }
+        self.new_branch = Some(text);
+    }
+
+    fn create_branch(&mut self, branch: String) {
+        let default_branch = self.default_branch.clone();
+        self.set_flash(
+            format!("Creating {branch} from origin/{default_branch}…"),
+            false,
+        );
+        self.spawn(move || {
+            let result = worktree::create(&branch, &default_branch);
+            Msg::OpenedBranch(branch, result)
+        });
     }
 
     fn on_prompt_key(&mut self, key: KeyEvent, prompt: Prompt) {
@@ -410,6 +580,9 @@ impl App {
                     }
                     Prompt::RemoveWorktree { number, .. } => {
                         format!("Kept the worktree for PR #{number}")
+                    }
+                    Prompt::RemoveLocal { branch, .. } => {
+                        format!("Kept the worktree for {branch}")
                     }
                 };
                 self.set_flash(text, false);
@@ -451,7 +624,16 @@ impl App {
                 path,
             } => {
                 self.set_flash(format!("Removing the worktree for PR #{number}…"), false);
-                self.spawn(move || Msg::RemovedWorktree(number, worktree::remove(&branch, &path)));
+                self.spawn(move || {
+                    Msg::RemovedWorktree(format!("PR #{number}"), worktree::remove(&branch, &path))
+                });
+            }
+            Prompt::RemoveLocal { branch, path, .. } => {
+                self.set_flash(format!("Removing the worktree for {branch}…"), false);
+                self.spawn(move || {
+                    let result = worktree::remove(&branch, &path);
+                    Msg::RemovedWorktree(branch, result)
+                });
             }
         }
     }
@@ -460,7 +642,7 @@ impl App {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model::{AutoMerge, Ci, CiState, Label, Merge, Review};
+    use crate::model::{AutoMerge, Ci, CiState, Label, Merge, Review, WorktreeStatus};
 
     pub fn sample_pr(number: u64, title: &str) -> PullRequest {
         PullRequest {
@@ -487,19 +669,49 @@ pub(crate) mod tests {
         }
     }
 
-    pub fn app_with(prs: Vec<PullRequest>) -> App {
+    pub fn sample_worktree(branch: &str, progress: Progress) -> Worktree {
+        Worktree {
+            branch: branch.into(),
+            path: format!("/src/repo.{}", branch.replace('/', "-")),
+            subject: Some("Last commit".into()),
+            committed_at: None,
+            status: Some(WorktreeStatus {
+                uncommitted: false,
+                progress: Some(progress),
+            }),
+        }
+    }
+
+    fn unloaded_app() -> App {
         let (tx, _rx) = mpsc::channel();
         let repo = Repo {
             name: "o/r".into(),
             default_branch: "main".into(),
         };
         let mut app = App::new(repo, tx);
+        app.branch_prefix = "me/".into();
+        app
+    }
+
+    pub fn app_with(prs: Vec<PullRequest>) -> App {
+        let mut app = unloaded_app();
         app.set_prs(prs);
         app
     }
 
     fn press(app: &mut App, c: char) {
         app.on_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+
+    fn press_key(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::from(code));
+    }
+
+    fn selected_branch(app: &App) -> Option<&str> {
+        match app.selected()? {
+            Row::Pr(_) => None,
+            Row::Local(worktree) => Some(&worktree.branch),
+        }
     }
 
     pub fn claude_label() -> Label {
@@ -579,7 +791,7 @@ pub(crate) mod tests {
                 prs: vec![sample_pr(1, "a")],
                 claude_review_label: Some(claude_label()),
             }),
-            HashMap::new(),
+            Vec::new(),
         ));
         assert!(app.prs[0].has_claude_review());
         assert!(app.claude_review_updates.is_empty());
@@ -590,7 +802,7 @@ pub(crate) mod tests {
                 prs: vec![sample_pr(1, "a")],
                 claude_review_label: None,
             }),
-            HashMap::new(),
+            Vec::new(),
         ));
         assert!(!app.prs[0].has_claude_review());
         assert!(app.claude_review_label.is_none());
@@ -691,7 +903,7 @@ pub(crate) mod tests {
         assert_eq!(app.flash().unwrap().text, "PR #3 has no worktree");
 
         app.worktrees
-            .insert("feature".into(), "/src/repo.feature".into());
+            .push(sample_worktree("feature", Progress::Ahead(1)));
         press(&mut app, 'W');
         assert!(matches!(
             &app.prompt,
@@ -705,7 +917,7 @@ pub(crate) mod tests {
     #[test]
     fn refresh_updates_worktrees() {
         let mut app = app_with(vec![sample_pr(3, "a")]);
-        let worktrees = HashMap::from([("feature".to_owned(), "/src/repo.feature".to_owned())]);
+        let worktrees = vec![sample_worktree("feature", Progress::Ahead(1))];
         app.on_msg(Msg::Prs(
             Ok(PrSnapshot {
                 prs: vec![sample_pr(3, "a")],
@@ -714,6 +926,141 @@ pub(crate) mod tests {
             worktrees,
         ));
         assert_eq!(app.worktree_for(&app.prs[0]), Some("/src/repo.feature"));
+    }
+
+    #[test]
+    fn local_rows_include_worktrees_of_your_prs() {
+        let mut app = unloaded_app();
+        app.set_worktrees(vec![
+            sample_worktree("feature", Progress::Ahead(1)),
+            sample_worktree("me/a", Progress::Empty),
+        ]);
+        // Local rows don't wait for PRs to load.
+        assert_eq!(selected_branch(&app), Some("feature"));
+        assert!(app.pr_for(&app.worktrees[0]).is_none());
+
+        app.set_prs(vec![sample_pr(3, "a")]);
+        assert_eq!(app.pr_for(&app.worktrees[0]).unwrap().number, 3);
+        assert!(app.pr_for(&app.worktrees[1]).is_none());
+    }
+
+    #[test]
+    fn selection_moves_from_prs_into_local_rows() {
+        let mut app = app_with(vec![sample_pr(1, "a")]);
+        app.set_worktrees(vec![
+            sample_worktree("feature", Progress::Ahead(1)),
+            sample_worktree("me/a", Progress::Empty),
+            sample_worktree("me/b", Progress::Merged),
+        ]);
+
+        assert_eq!(app.selected_pr().unwrap().number, 1);
+        press(&mut app, 'j');
+        assert_eq!(selected_branch(&app), Some("feature"));
+        assert!(app.selected_pr().is_none());
+        assert_eq!(app.list.selected(), None);
+        press(&mut app, 'j');
+        assert_eq!(selected_branch(&app), Some("me/a"));
+        press(&mut app, 'G');
+        assert_eq!(selected_branch(&app), Some("me/b"));
+        press(&mut app, 'j');
+        assert_eq!(selected_branch(&app), Some("me/b"));
+        press(&mut app, 'g');
+        assert_eq!(app.selected_pr().unwrap().number, 1);
+        assert_eq!(app.local_list.selected(), None);
+    }
+
+    #[test]
+    fn refresh_keeps_selected_local_row_by_branch() {
+        let mut app = app_with(vec![sample_pr(1, "a")]);
+        app.set_worktrees(vec![
+            sample_worktree("me/a", Progress::Empty),
+            sample_worktree("me/b", Progress::Empty),
+        ]);
+        press(&mut app, 'G');
+        app.set_worktrees(vec![
+            sample_worktree("me/new", Progress::Empty),
+            sample_worktree("me/b", Progress::Empty),
+        ]);
+        assert_eq!(selected_branch(&app), Some("me/b"));
+
+        // A new PR row above doesn't move the selection off its branch.
+        app.set_prs(vec![sample_pr(1, "a"), sample_pr(2, "b")]);
+        assert_eq!(selected_branch(&app), Some("me/b"));
+        assert_eq!(app.local_list.selected(), Some(1));
+
+        // When the branch goes away, the same position is selected.
+        app.set_worktrees(vec![sample_worktree("me/new", Progress::Empty)]);
+        assert_eq!(selected_branch(&app), Some("me/new"));
+    }
+
+    #[test]
+    fn pr_only_keys_do_nothing_on_local_rows() {
+        let mut app = app_with(vec![]);
+        app.claude_review_label = Some(claude_label());
+        app.set_worktrees(vec![sample_worktree("me/a", Progress::Empty)]);
+        for key in ['o', 'c', 'l'] {
+            press(&mut app, key);
+        }
+        press_key(&mut app, KeyCode::Enter);
+        assert!(app.flash().is_none());
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn remove_local_worktree_needs_confirmation() {
+        let mut app = app_with(vec![]);
+        app.set_worktrees(vec![sample_worktree("me/a", Progress::Ahead(2))]);
+        press(&mut app, 'W');
+        assert!(matches!(
+            &app.prompt,
+            Some(Prompt::RemoveLocal { branch, path, progress: Some(Progress::Ahead(2)) })
+                if branch == "me/a" && path == "/src/repo.me-a"
+        ));
+        press(&mut app, 'n');
+        assert!(app.prompt.is_none());
+        assert_eq!(app.flash().unwrap().text, "Kept the worktree for me/a");
+    }
+
+    #[test]
+    fn new_branch_input_previews_and_cancels() {
+        let mut app = app_with(vec![sample_pr(1, "a"), sample_pr(2, "b")]);
+        press(&mut app, 'n');
+        assert_eq!(app.new_branch.as_deref(), Some(""));
+        assert_eq!(app.new_branch_name(), None);
+
+        // Enter does nothing until the text names a branch.
+        press_key(&mut app, KeyCode::Enter);
+        assert!(app.new_branch.is_some());
+        assert!(app.flash().is_none());
+
+        // Keys that normally act are typed instead.
+        for c in "Fix Bob's jq!".chars() {
+            press(&mut app, c);
+        }
+        assert_eq!(app.new_branch_name().as_deref(), Some("me/fix-bobs-jq"));
+        assert!(!app.should_quit);
+        assert_eq!(app.list.selected(), Some(0));
+        press_key(&mut app, KeyCode::Backspace);
+        press_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.new_branch_name().as_deref(), Some("me/fix-bobs-j"));
+
+        press_key(&mut app, KeyCode::Esc);
+        assert!(app.new_branch.is_none());
+        assert!(!app.should_quit);
+        assert!(app.flash().is_none());
+    }
+
+    #[test]
+    fn opened_branch_reports_errors() {
+        let mut app = app_with(vec![]);
+        app.on_msg(Msg::OpenedBranch(
+            "me/a".into(),
+            Err(anyhow::anyhow!(
+                "`wt switch` failed: Branch me/a already exists"
+            )),
+        ));
+        assert!(app.flash().unwrap().is_error);
+        assert!(app.flash().unwrap().text.contains("already exists"));
     }
 
     #[test]

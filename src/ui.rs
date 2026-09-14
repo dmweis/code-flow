@@ -9,9 +9,10 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph, Wrap};
 
-use crate::app::{App, Prompt};
+use crate::app::{App, Prompt, Row};
 use crate::model::{
-    AutoMerge, CLAUDE_REVIEW_LABEL, Ci, CiState, Label, Merge, PullRequest, Review,
+    AutoMerge, CLAUDE_REVIEW_LABEL, Ci, CiState, Label, Merge, Progress, PullRequest, Review,
+    Worktree,
 };
 use crate::worktree::tilde;
 
@@ -31,6 +32,38 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(prompt) = &app.prompt {
         draw_prompt(frame, prompt, &app.default_branch);
     }
+    if app.new_branch.is_some() {
+        draw_new_branch(frame, app);
+    }
+}
+
+fn draw_new_branch(frame: &mut Frame, app: &App) {
+    let text = app.new_branch.as_deref().unwrap_or_default();
+    let preview = match app.new_branch_name() {
+        Some(name) => Line::from(vec!["→ ".dark_gray(), name.bold()]),
+        None => Line::from(format!("→ {}…", app.branch_prefix).dark_gray()),
+    };
+    let lines = vec![
+        Line::from(vec![text.into(), "▏".yellow()]),
+        preview,
+        Line::default(),
+        Line::from(
+            format!(
+                "Creates the branch from a freshly fetched origin/{} in a new worktree.",
+                app.default_branch
+            )
+            .dark_gray(),
+        ),
+        Line::default(),
+        Line::from(vec![
+            " Enter ".bold().black().on_yellow(),
+            " create    ".into(),
+            " Esc ".bold().reversed(),
+            " cancel".into(),
+        ])
+        .centered(),
+    ];
+    draw_dialog(frame, " New branch ", lines);
 }
 
 fn draw_prompt(frame: &mut Frame, prompt: &Prompt, default_branch: &str) {
@@ -95,6 +128,29 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, default_branch: &str) {
             "remove",
             "keep",
         ),
+        Prompt::RemoveLocal {
+            branch,
+            path,
+            progress,
+        } => (
+            " Remove worktree ",
+            vec![
+                Line::from(vec![
+                    "Remove the worktree for ".into(),
+                    branch.as_str().bold(),
+                    " at ".into(),
+                    tilde(path).bold(),
+                    "? Its Herdr workspace, and anything running in it, is closed too.".into(),
+                ]),
+                Line::default(),
+                Line::from(format!(
+                    "worktrunk refuses if the worktree has uncommitted changes. {}",
+                    branch_fate(*progress)
+                )),
+            ],
+            "remove",
+            "keep",
+        ),
     };
     lines.extend([
         Line::default(),
@@ -106,6 +162,23 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, default_branch: &str) {
         ])
         .centered(),
     ]);
+    draw_dialog(frame, title, lines);
+}
+
+/// What `wt remove` does with a branch, which it deletes only once merged.
+fn branch_fate(progress: Option<Progress>) -> String {
+    match progress {
+        Some(Progress::Empty) => {
+            "The branch has no commits of its own, so it's deleted too.".into()
+        }
+        Some(Progress::Merged) => "The branch is merged, so it's deleted too.".into(),
+        Some(Progress::Ahead(1)) => "The branch has 1 unmerged commit, so it's kept.".into(),
+        Some(Progress::Ahead(n)) => format!("The branch has {n} unmerged commits, so it's kept."),
+        None => "The branch is kept unless it's merged.".into(),
+    }
+}
+
+fn draw_dialog(frame: &mut Frame, title: &str, lines: Vec<Line>) {
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
     let width = 64.min(frame.area().width);
     let height = paragraph.line_count(width.saturating_sub(4)) as u16 + 2;
@@ -118,7 +191,77 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, default_branch: &str) {
     frame.render_widget(paragraph.block(block), area);
 }
 
+/// PRs on top, and below them every local worktree.
 fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
+    let local: Vec<_> = app
+        .worktrees
+        .iter()
+        .map(|worktree| local_item(worktree, app.pr_for(worktree)))
+        .collect();
+    if local.is_empty() {
+        draw_prs(frame, app, area);
+        return;
+    }
+    let height = (local.len() as u16 * 2 + 2).min(area.height / 2);
+    let [prs, local_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(height)]).areas(area);
+    let title = format!(" Local worktrees ({}) ", local.len());
+    let list = selectable(List::new(local).block(Block::bordered().title(title.bold())));
+    frame.render_stateful_widget(list, local_area, &mut app.local_list);
+    draw_prs(frame, app, prs);
+}
+
+fn selectable(list: List) -> List {
+    list.highlight_style(Style::new().bg(Color::Indexed(237)).bold())
+        .highlight_symbol("▶ ")
+        .highlight_spacing(HighlightSpacing::Always)
+}
+
+/// The branch, then the title of your PR for it if there is one.
+fn local_item(worktree: &Worktree, pr: Option<&PullRequest>) -> ListItem<'static> {
+    let mut title = vec![Span::raw(worktree.branch.clone())];
+    if let Some(pr) = pr {
+        title.extend([
+            format!("  #{} ", pr.number).dark_gray(),
+            Span::raw(pr.title.clone()),
+        ]);
+    }
+    let mut status = vec![Span::raw("  ")];
+    let badges = local_badges(worktree);
+    if badges.is_empty() {
+        status.push(tilde(&worktree.path).dark_gray());
+    }
+    for badge in badges {
+        status.extend([badge, Span::raw("  ")]);
+    }
+    ListItem::new(vec![Line::from(title), Line::from(status)])
+}
+
+/// Short colored status words for a local row; none without worktrunk.
+fn local_badges(worktree: &Worktree) -> Vec<Span<'static>> {
+    let Some(status) = worktree.status else {
+        return Vec::new();
+    };
+    let badge = |glyph: Span<'static>, text: &str| {
+        Span::styled(format!("{} {text}", glyph.content), glyph.style)
+    };
+    let mut badges = Vec::new();
+    if status.uncommitted {
+        badges.push(badge(uncommitted_glyph(), "uncommitted"));
+    }
+    if let Some(progress) = status.progress {
+        let text = match progress {
+            Progress::Empty => "empty".to_owned(),
+            Progress::Ahead(1) => "1 commit".to_owned(),
+            Progress::Ahead(n) => format!("{n} commits"),
+            Progress::Merged => "merged".to_owned(),
+        };
+        badges.push(badge(progress_glyph(progress), &text));
+    }
+    badges
+}
+
+fn draw_prs(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = format!(" My PRs · {} ({}) ", app.repo, app.prs.len());
     let block = Block::bordered().title(title.bold());
 
@@ -143,7 +286,6 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|pr| pr.number.to_string().len())
         .max()
         .unwrap_or(1);
-    let worktrees = &app.worktrees;
     let items = app.prs.iter().map(|pr| {
         let mut title = vec![format!("#{:<number_width$} ", pr.number).dark_gray()];
         title.extend([Span::raw(pr.title.as_str()), Span::raw(" ")]);
@@ -151,7 +293,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         let mut status = vec![Span::raw(" ".repeat(number_width + 2))];
         for badge in status_badges(
             pr,
-            worktrees.contains_key(&pr.head),
+            app.worktree_for(pr).is_some(),
             claude_review_badge(app, pr),
         ) {
             status.extend([badge, Span::raw("  ")]);
@@ -159,11 +301,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         status.pop();
         ListItem::new(vec![Line::from(title), Line::from(status)])
     });
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::new().bg(Color::Indexed(237)).bold())
-        .highlight_symbol("▶ ")
-        .highlight_spacing(HighlightSpacing::Always);
+    let list = selectable(List::new(items).block(block));
     frame.render_stateful_widget(list, area, &mut app.list);
 }
 
@@ -236,8 +374,71 @@ fn status_badges(
 }
 
 fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
+    match app.selected() {
+        Some(Row::Pr(_)) => draw_pr_detail(frame, app, area),
+        Some(Row::Local(worktree)) => {
+            let lines = local_lines(worktree, app.pr_for(worktree), &app.default_branch);
+            let block = Block::bordered().title(" Local worktree ".bold());
+            let detail = Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(block);
+            frame.render_widget(detail, area);
+        }
+        None => frame.render_widget(Block::bordered().title(" Details "), area),
+    }
+}
+
+fn local_lines<'a>(
+    worktree: &'a Worktree,
+    pr: Option<&PullRequest>,
+    default_branch: &str,
+) -> Vec<Line<'a>> {
+    let mut lines = vec![Line::from(worktree.branch.as_str().bold())];
+    if let Some(subject) = &worktree.subject {
+        lines.push(Line::from(format!("Last commit: {subject}").dark_gray()));
+    }
+    lines.push(Line::default());
+
+    let status =
+        |glyph: Span<'static>, text: String| Line::from(vec![glyph, " ".into(), text.into()]);
+    match worktree.status {
+        Some(worktree_status) => {
+            lines.push(match worktree_status.uncommitted {
+                true => status(uncommitted_glyph(), "Uncommitted changes".into()),
+                false => status("✓".green(), "No uncommitted changes".into()),
+            });
+            lines.push(match worktree_status.progress {
+                Some(progress) => status(
+                    progress_glyph(progress),
+                    progress_text(progress, default_branch),
+                ),
+                None => status(
+                    "?".dark_gray(),
+                    format!("Shares no history with {default_branch}"),
+                ),
+            });
+        }
+        None => lines.push(Line::from(
+            "Install worktrunk to see this worktree's status".dark_gray(),
+        )),
+    }
+    lines.push(status(
+        worktree_glyph(),
+        format!("Worktree at {}", tilde(&worktree.path)),
+    ));
+    lines.push(Line::default());
+    lines.push(match pr {
+        Some(pr) => Line::from(vec![
+            format!("Your PR #{}: ", pr.number).into(),
+            pr.title.clone().bold(),
+        ]),
+        None => Line::from("None of your open PRs uses this branch.".dark_gray()),
+    });
+    lines
+}
+
+fn draw_pr_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(pr) = app.selected_pr() else {
-        frame.render_widget(Block::bordered().title(" Details "), area);
         return;
     };
     let inner_width = area.width.saturating_sub(2);
@@ -331,31 +532,28 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Some(flash) if flash.is_error => Line::from(format!(" {}", flash.text).red()),
         Some(flash) => Line::from(format!(" {}", flash.text).green()),
         None => {
-            let mut keys = vec![
-                ("j/k", "move"),
-                ("o", "open"),
-                ("c", "checkout"),
-                ("w", "worktree"),
-            ];
-            if app
-                .selected_pr()
-                .is_some_and(|pr| app.can_add_claude_review(pr))
-            {
-                keys.push(("l", "add claude-review"));
+            let mut keys = vec![("j/k", "move")];
+            match app.selected() {
+                Some(Row::Pr(pr)) => {
+                    keys.extend([("o", "open"), ("c", "checkout"), ("w", "worktree")]);
+                    if app.can_add_claude_review(pr) {
+                        keys.push(("l", "add claude-review"));
+                    }
+                    // Only offer removal where there's something to remove.
+                    if app.worktree_for(pr).is_some() {
+                        keys.push(("W", "remove worktree"));
+                    }
+                }
+                Some(Row::Local(_)) => {
+                    keys.extend([("w", "workspace"), ("W", "remove worktree")]);
+                }
+                None => {}
             }
-            // Only offer removal where there's something to remove.
-            if app
-                .selected_pr()
-                .is_some_and(|pr| app.worktree_for(pr).is_some())
-            {
-                keys.push(("W", "remove worktree"));
+            keys.extend([("n", "new branch"), ("r", "refresh")]);
+            if !matches!(app.selected(), Some(Row::Local(_))) {
+                keys.push(("J/K", "scroll"));
             }
-            keys.extend([
-                ("r", "refresh"),
-                ("J/K", "scroll"),
-                ("?", "keys"),
-                ("q", "quit"),
-            ]);
+            keys.extend([("?", "keys"), ("q", "quit")]);
             let spans = keys.into_iter().flat_map(|(key, action)| {
                 [format!(" {key}").bold(), format!(" {action} ").dark_gray()]
             });
@@ -376,7 +574,8 @@ fn draw_help(frame: &mut Frame, app: &App) {
         key("o  Enter", "open in browser"),
         key("c", "gh pr checkout"),
         key("w", "worktree (+ Herdr workspace)"),
-        key("W", "remove the PR's worktree"),
+        key("W", "remove the selected worktree"),
+        key("n", "new branch in its own worktree"),
         key("r", "refresh now (auto every 60s)"),
         key("q  Esc", "quit"),
     ];
@@ -432,6 +631,27 @@ fn label_chips(labels: &[Label]) -> Vec<Span<'_>> {
 
 fn worktree_glyph() -> Span<'static> {
     "⌂".blue()
+}
+
+fn uncommitted_glyph() -> Span<'static> {
+    "●".yellow()
+}
+
+fn progress_glyph(progress: Progress) -> Span<'static> {
+    match progress {
+        Progress::Empty => "◌".dark_gray(),
+        Progress::Ahead(_) => "↑".cyan(),
+        Progress::Merged => "✓".green(),
+    }
+}
+
+fn progress_text(progress: Progress, default_branch: &str) -> String {
+    match progress {
+        Progress::Empty => "No commits of its own yet".into(),
+        Progress::Ahead(1) => format!("1 commit not in {default_branch}"),
+        Progress::Ahead(n) => format!("{n} commits not in {default_branch}"),
+        Progress::Merged => format!("Its changes are already in {default_branch}"),
+    }
 }
 
 fn draft_glyph(is_draft: bool) -> Span<'static> {
@@ -534,7 +754,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::app::tests::{app_with, claude_label, sample_pr};
+    use crate::app::tests::{app_with, claude_label, sample_pr, sample_worktree};
 
     fn render(app: &mut App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(150, 24)).unwrap();
@@ -697,7 +917,7 @@ mod tests {
         assert!(!render(&mut app).contains("W remove worktree"));
 
         app.worktrees
-            .insert("feature".into(), "/src/repo.feature".into());
+            .push(sample_worktree("feature", Progress::Ahead(1)));
         let screen = render(&mut app);
         assert!(screen.contains(" W remove worktree "), "{screen}");
         assert!(screen.contains("12 threads  ⌂ worktree"), "{screen}");
@@ -705,11 +925,98 @@ mod tests {
             screen.contains("⌂ Worktree at /src/repo.feature"),
             "{screen}"
         );
+        // The PR's worktree is also a local row, named by the PR.
+        assert!(screen.contains("Local worktrees (1)"), "{screen}");
+        assert!(screen.contains("feature  #482 Add retry logic"), "{screen}");
+
+        app.list.select(None);
+        app.local_list.select(Some(0));
+        let screen = render(&mut app);
+        assert!(screen.contains("Your PR #482: Add retry logic"), "{screen}");
     }
 
     #[test]
     fn renders_empty_state() {
         let mut app = app_with(vec![]);
         assert!(render(&mut app).contains("No open PRs by you in o/r"));
+    }
+
+    #[test]
+    fn renders_local_worktrees_below_prs() {
+        let mut app = app_with(vec![sample_pr(482, "Add retry logic")]);
+        let mut dirty = sample_worktree("me/busy", Progress::Ahead(3));
+        dirty.status.as_mut().unwrap().uncommitted = true;
+        let mut untracked = sample_worktree("me/plain", Progress::Empty);
+        untracked.status = None;
+        app.worktrees = vec![
+            dirty,
+            sample_worktree("me/done", Progress::Merged),
+            untracked,
+        ];
+        let screen = render(&mut app);
+        assert!(screen.contains("Local worktrees (3)"), "{screen}");
+        assert!(screen.contains("me/busy"), "{screen}");
+        assert!(screen.contains("● uncommitted  ↑ 3 commits"), "{screen}");
+        assert!(screen.contains("✓ merged"), "{screen}");
+        // Without worktrunk's status, the path stands in for it.
+        assert!(screen.contains("/src/repo.me-plain"), "{screen}");
+        assert!(screen.contains(" n new branch "), "{screen}");
+
+        app.local_list.select(Some(0));
+        app.list.select(None);
+        let screen = render(&mut app);
+        assert!(screen.contains("Local worktree "), "{screen}");
+        assert!(screen.contains("Last commit: Last commit"), "{screen}");
+        assert!(screen.contains("● Uncommitted changes"), "{screen}");
+        assert!(screen.contains("↑ 3 commits not in main"), "{screen}");
+        assert!(
+            screen.contains("⌂ Worktree at /src/repo.me-busy"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains(" w workspace  W remove worktree "),
+            "{screen}"
+        );
+        assert!(!screen.contains("checkout"), "{screen}");
+        assert!(!screen.contains("J/K"), "{screen}");
+    }
+
+    #[test]
+    fn remove_local_prompt_says_what_happens_to_the_branch() {
+        let mut app = app_with(vec![]);
+        app.prompt = Some(Prompt::RemoveLocal {
+            branch: "me/busy".into(),
+            path: "/src/repo.me-busy".into(),
+            progress: Some(Progress::Ahead(3)),
+        });
+        let screen = render(&mut app);
+        assert!(screen.contains("Remove worktree"), "{screen}");
+        assert!(
+            screen.contains("3 unmerged commits, so it's kept"),
+            "{screen}"
+        );
+        assert_eq!(
+            branch_fate(Some(Progress::Empty)),
+            "The branch has no commits of its own, so it's deleted too."
+        );
+        assert_eq!(
+            branch_fate(Some(Progress::Merged)),
+            "The branch is merged, so it's deleted too."
+        );
+    }
+
+    #[test]
+    fn renders_new_branch_input() {
+        let mut app = app_with(vec![]);
+        app.new_branch = Some(String::new());
+        let screen = render(&mut app);
+        assert!(screen.contains("New branch"), "{screen}");
+        assert!(screen.contains("→ me/…"), "{screen}");
+        assert!(screen.contains("freshly fetched origin/main"), "{screen}");
+
+        app.new_branch = Some("Fix the \"flaky\" CI".into());
+        let screen = render(&mut app);
+        assert!(screen.contains("Fix the \"flaky\" CI▏"), "{screen}");
+        assert!(screen.contains("→ me/fix-the-flaky-ci"), "{screen}");
     }
 }
