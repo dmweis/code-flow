@@ -33,6 +33,11 @@ enum Msg {
     OpenedBranch(String, Result<OpenedWorktree>),
     /// Names what lost its worktree: "PR #3" or a branch.
     RemovedWorktree(String, Result<bool>),
+    /// The branch checked out where code-flow runs.
+    Branch(Result<String>),
+    /// Commits fast-forwarded into the default branch, or `None` when it
+    /// isn't checked out.
+    PulledDefaultBranch(Result<Option<u32>>),
 }
 
 /// A selectable row: one of your open PRs, or a local worktree without one.
@@ -112,6 +117,9 @@ pub struct App {
     pub branch_prefix: String,
     /// What's typed so far while the new branch input is open.
     pub new_branch: Option<String>,
+    /// The branch checked out where code-flow runs, once known.
+    pub current_branch: Option<String>,
+    pub pulling: bool,
     /// When the in-flight fetch started, if one is running.
     pub loading_since: Option<Instant>,
     pub last_success: Option<Instant>,
@@ -164,6 +172,8 @@ impl App {
             prompt: None,
             branch_prefix: String::new(),
             new_branch: None,
+            current_branch: None,
+            pulling: false,
             loading_since: None,
             last_success: None,
             last_attempt: None,
@@ -281,6 +291,28 @@ impl App {
             let worktrees = worktree::list_worktrees().unwrap_or_default();
             Msg::Prs(prs, worktrees)
         });
+        self.refresh_branch();
+    }
+
+    fn refresh_branch(&self) {
+        self.spawn(|| Msg::Branch(github::current_branch()));
+    }
+
+    /// Pulling is offered only with the default branch checked out here.
+    pub fn can_pull(&self) -> bool {
+        !self.pulling && self.current_branch.as_ref() == Some(&self.default_branch)
+    }
+
+    /// Brings the default branch up to date with `origin` if that's a
+    /// fast-forward, and warns otherwise.
+    fn pull_default_branch(&mut self) {
+        if !self.can_pull() {
+            return;
+        }
+        let default_branch = self.default_branch.clone();
+        self.pulling = true;
+        self.set_flash(format!("Pulling {default_branch} from origin…"), false);
+        self.spawn(move || Msg::PulledDefaultBranch(github::pull_default_branch(&default_branch)));
     }
 
     fn refresh_worktrees(&self) {
@@ -379,14 +411,18 @@ impl App {
                     false => format!("Checked out #{number}: {output}"),
                 };
                 self.set_flash(text, false);
+                self.refresh_branch();
             }
             Msg::CheckedOut(number, Ok(Checkout::Diverged { branch })) => {
                 self.flash = None;
                 self.prompt = Some(Prompt::ForceCheckout { number, branch });
+                self.refresh_branch();
             }
             Msg::OpenedWorktree(number, Ok(OpenOutcome::Opened(opened))) => {
                 self.set_flash(opened.summary(&format!("PR #{number}")), false);
                 self.refresh_worktrees();
+                // Moving a PR to a worktree may have switched this checkout.
+                self.refresh_branch();
             }
             Msg::OpenedBranch(branch, Ok(opened)) => {
                 self.set_flash(opened.summary(&branch), false);
@@ -409,6 +445,33 @@ impl App {
                 };
                 self.set_flash(text, false);
                 self.refresh_worktrees();
+            }
+            Msg::Branch(result) => self.current_branch = result.ok(),
+            Msg::PulledDefaultBranch(result) => {
+                self.pulling = false;
+                let default_branch = &self.default_branch;
+                let (text, is_error) = match result {
+                    Ok(None) => {
+                        // The branch changed outside code-flow.
+                        self.refresh_branch();
+                        (
+                            format!("Not on {default_branch}, so nothing was pulled"),
+                            false,
+                        )
+                    }
+                    Ok(Some(0)) => (format!("{default_branch} is up to date"), false),
+                    Ok(Some(count)) => {
+                        let noun = if count == 1 { "commit" } else { "commits" };
+                        // Worktree progress is measured against the default branch.
+                        self.refresh_worktrees();
+                        (
+                            format!("Pulled {count} new {noun} into {default_branch}"),
+                            false,
+                        )
+                    }
+                    Err(err) => (format!("Didn't pull {default_branch}: {err:#}"), true),
+                };
+                self.set_flash(text, is_error);
             }
             Msg::CheckedOut(_, Err(err))
             | Msg::Opened(Err(err))
@@ -544,6 +607,7 @@ impl App {
                 }
             }
             KeyCode::Char('n') => self.new_branch = Some(String::new()),
+            KeyCode::Char('p') => self.pull_default_branch(),
             KeyCode::Char('w') => match self.selected() {
                 Some(Row::Pr(pr)) => {
                     let (number, branch) = (pr.number, pr.head.clone());
@@ -1227,6 +1291,65 @@ pub(crate) mod tests {
         ));
         assert!(app.flash().unwrap().is_error);
         assert!(app.flash().unwrap().text.contains("already exists"));
+    }
+
+    // Pull tests never press `p` on the default branch: that would fetch and
+    // merge in whatever checkout the tests run from.
+
+    #[test]
+    fn pull_is_offered_only_on_the_default_branch() {
+        let mut app = app_with(vec![]);
+        assert!(!app.can_pull());
+        press(&mut app, 'p');
+        assert!(!app.pulling);
+        assert!(app.flash().is_none());
+
+        app.on_msg(Msg::Branch(Ok("me/feature".into())));
+        assert!(!app.can_pull());
+        press(&mut app, 'p');
+        assert!(app.flash().is_none());
+
+        app.on_msg(Msg::Branch(Ok("main".into())));
+        assert!(app.can_pull());
+        // Not while a pull is already running.
+        app.pulling = true;
+        assert!(!app.can_pull());
+        press(&mut app, 'p');
+        assert!(app.flash().is_none());
+
+        app.on_msg(Msg::Branch(Err(anyhow::anyhow!("not a git repository"))));
+        assert_eq!(app.current_branch, None);
+    }
+
+    #[test]
+    fn reports_pulling_the_default_branch() {
+        let mut app = app_with(vec![]);
+        app.pulling = true;
+        app.on_msg(Msg::PulledDefaultBranch(Ok(Some(0))));
+        assert!(!app.pulling);
+        assert_eq!(app.flash().unwrap().text, "main is up to date");
+
+        app.on_msg(Msg::PulledDefaultBranch(Ok(Some(1))));
+        assert_eq!(app.flash().unwrap().text, "Pulled 1 new commit into main");
+        app.on_msg(Msg::PulledDefaultBranch(Ok(Some(3))));
+        assert_eq!(app.flash().unwrap().text, "Pulled 3 new commits into main");
+        assert!(!app.flash().unwrap().is_error);
+    }
+
+    #[test]
+    fn warns_when_the_default_branch_cant_fast_forward() {
+        let mut app = app_with(vec![]);
+        app.pulling = true;
+        app.on_msg(Msg::PulledDefaultBranch(Err(anyhow::anyhow!(
+            "your main has commits origin/main doesn't, so it can't fast-forward"
+        ))));
+        assert!(!app.pulling);
+        let flash = app.flash().unwrap();
+        assert!(flash.is_error);
+        assert_eq!(
+            flash.text,
+            "Didn't pull main: your main has commits origin/main doesn't, so it can't fast-forward"
+        );
     }
 
     #[test]
