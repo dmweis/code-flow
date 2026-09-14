@@ -11,7 +11,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::widgets::ListState;
 
 use crate::github::{self, Checkout, PrSnapshot, Repo};
-use crate::model::{Label, Progress, PullRequest, Worktree};
+use crate::model::{Label, MergeMethod, Progress, PullRequest, Worktree};
 use crate::ui;
 use crate::worktree::{self, OpenOutcome, OpenedWorktree};
 
@@ -23,6 +23,8 @@ const FLASH_DURATION: Duration = Duration::from_secs(5);
 enum Msg {
     Prs(Result<PrSnapshot>, Vec<Worktree>),
     ClaudeReviewAdded(u64, Label, Result<()>),
+    /// Whether the PR merged, rather than joining a merge queue.
+    Merged(u64, Result<bool>),
     Worktrees(Result<Vec<Worktree>>),
     CheckedOut(u64, Result<Checkout>),
     Opened(Result<()>),
@@ -76,6 +78,13 @@ pub enum Prompt {
         /// Decides whether worktrunk deletes the branch too.
         progress: Option<Progress>,
     },
+    Merge {
+        number: u64,
+        title: String,
+        base: String,
+        head_oid: String,
+        method: MergeMethod,
+    },
 }
 
 pub struct App {
@@ -86,6 +95,10 @@ pub struct App {
     pub adding_claude_review: HashSet<u64>,
     /// Successful edits that an already-running refresh may not have seen.
     claude_review_updates: HashMap<u64, Label>,
+    pub merge_method: MergeMethod,
+    pub merging: HashSet<u64>,
+    /// Merged PRs that GitHub's search may still list as open for a while.
+    merged: HashSet<u64>,
     /// Linked worktrees, newest commit first.
     pub worktrees: Vec<Worktree>,
     /// The selection among PR rows. `local_list` holds it among local rows;
@@ -140,6 +153,9 @@ impl App {
             claude_review_label: None,
             adding_claude_review: HashSet::new(),
             claude_review_updates: HashMap::new(),
+            merge_method: MergeMethod::Merge,
+            merging: HashSet::new(),
+            merged: HashSet::new(),
             worktrees: Vec::new(),
             list: ListState::default(),
             local_list: ListState::default(),
@@ -211,6 +227,23 @@ impl App {
         });
     }
 
+    pub fn can_merge(&self, pr: &PullRequest) -> bool {
+        pr.is_ready_to_merge() && !self.merging.contains(&pr.number)
+    }
+
+    fn ask_to_merge(&mut self) {
+        let Some(pr) = self.selected_pr().filter(|pr| self.can_merge(pr)) else {
+            return;
+        };
+        self.prompt = Some(Prompt::Merge {
+            number: pr.number,
+            title: pr.title.clone(),
+            base: pr.base.clone(),
+            head_oid: pr.head_oid.clone(),
+            method: self.merge_method,
+        });
+    }
+
     pub fn flash(&self) -> Option<&Flash> {
         self.flash
             .as_ref()
@@ -275,6 +308,10 @@ impl App {
                 self.set_worktrees(worktrees);
                 match result {
                     Ok(mut snapshot) => {
+                        let listed: HashSet<u64> =
+                            snapshot.prs.iter().map(|pr| pr.number).collect();
+                        self.merged.retain(|number| listed.contains(number));
+                        snapshot.prs.retain(|pr| !self.merged.contains(&pr.number));
                         for pr in &mut snapshot.prs {
                             if let Some(label) = self.claude_review_updates.get(&pr.number)
                                 && !pr.has_claude_review()
@@ -283,6 +320,7 @@ impl App {
                             }
                         }
                         self.claude_review_label = snapshot.claude_review_label;
+                        self.merge_method = snapshot.merge_method;
                         self.set_prs(snapshot.prs);
                     }
                     Err(err) => {
@@ -314,6 +352,24 @@ impl App {
                         true,
                     ),
                 }
+            }
+            Msg::Merged(number, result) => {
+                self.merging.remove(&number);
+                match result {
+                    Ok(true) => {
+                        self.merged.insert(number);
+                        let (previous, old_index) =
+                            (self.selected_id(), self.selected_index().unwrap_or(0));
+                        self.prs.retain(|pr| pr.number != number);
+                        self.restore_selection(previous, old_index);
+                        self.set_flash(format!("Merged #{number}"), false);
+                    }
+                    Ok(false) => {
+                        self.set_flash(format!("Added #{number} to the merge queue"), false)
+                    }
+                    Err(err) => self.set_flash(format!("Could not merge #{number}: {err:#}"), true),
+                }
+                self.refresh();
             }
             Msg::Worktrees(Ok(worktrees)) => self.set_worktrees(worktrees),
             Msg::Worktrees(Err(_)) => {}
@@ -473,6 +529,7 @@ impl App {
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('l') => self.add_claude_review(),
+            KeyCode::Char('m') => self.ask_to_merge(),
             KeyCode::Char('o') | KeyCode::Enter => {
                 if let Some(pr) = self.selected_pr() {
                     let (repo, number) = (self.repo.clone(), pr.number);
@@ -584,6 +641,7 @@ impl App {
                     Prompt::RemoveLocal { branch, .. } => {
                         format!("Kept the worktree for {branch}")
                     }
+                    Prompt::Merge { number, .. } => format!("Left #{number} unmerged"),
                 };
                 self.set_flash(text, false);
             }
@@ -635,6 +693,19 @@ impl App {
                     Msg::RemovedWorktree(branch, result)
                 });
             }
+            Prompt::Merge {
+                number,
+                head_oid,
+                method,
+                ..
+            } => {
+                let repo = self.repo.clone();
+                self.merging.insert(number);
+                self.set_flash(format!("Merging #{number}…"), false);
+                self.spawn(move || {
+                    Msg::Merged(number, github::merge(&repo, number, method, &head_oid))
+                });
+            }
         }
     }
 }
@@ -650,6 +721,7 @@ pub(crate) mod tests {
             title: title.into(),
             body: "Body text".into(),
             head: "feature".into(),
+            head_oid: "abc123".into(),
             base: "main".into(),
             is_draft: false,
             review: Review::Approved,
@@ -667,6 +739,27 @@ pub(crate) mod tests {
                 rgb: (0xd7, 0x3a, 0x4a),
             }],
         }
+    }
+
+    /// A PR that GitHub would merge now.
+    pub fn ready_pr(number: u64, title: &str) -> PullRequest {
+        let mut pr = sample_pr(number, title);
+        pr.ci.state = CiState::Passed;
+        pr.ci.pending = 0;
+        pr.merge = Merge::Ready;
+        pr.auto_merge = AutoMerge::Off;
+        pr
+    }
+
+    fn snapshot(prs: Vec<PullRequest>) -> Msg {
+        Msg::Prs(
+            Ok(PrSnapshot {
+                prs,
+                claude_review_label: None,
+                merge_method: MergeMethod::Squash,
+            }),
+            Vec::new(),
+        )
     }
 
     pub fn sample_worktree(branch: &str, progress: Progress) -> Worktree {
@@ -790,6 +883,7 @@ pub(crate) mod tests {
             Ok(PrSnapshot {
                 prs: vec![sample_pr(1, "a")],
                 claude_review_label: Some(claude_label()),
+                merge_method: MergeMethod::Merge,
             }),
             Vec::new(),
         ));
@@ -801,12 +895,83 @@ pub(crate) mod tests {
             Ok(PrSnapshot {
                 prs: vec![sample_pr(1, "a")],
                 claude_review_label: None,
+                merge_method: MergeMethod::Merge,
             }),
             Vec::new(),
         ));
         assert!(!app.prs[0].has_claude_review());
         assert!(app.claude_review_label.is_none());
         assert!(!app.can_add_claude_review(&app.prs[0]));
+    }
+
+    #[test]
+    fn merge_shortcut_asks_first_and_only_for_ready_prs() {
+        let mut app = app_with(vec![sample_pr(1, "a"), ready_pr(2, "b")]);
+        app.on_msg(snapshot(vec![sample_pr(1, "a"), ready_pr(2, "b")]));
+        press(&mut app, 'm');
+        assert!(app.prompt.is_none());
+
+        press(&mut app, 'j');
+        press(&mut app, 'm');
+        assert!(matches!(
+            &app.prompt,
+            Some(Prompt::Merge { number: 2, head_oid, method: MergeMethod::Squash, .. })
+                if head_oid == "abc123"
+        ));
+        press(&mut app, 'n');
+        assert!(app.prompt.is_none());
+        assert!(app.merging.is_empty());
+        assert_eq!(app.flash().unwrap().text, "Left #2 unmerged");
+
+        // No second merge while one is running.
+        app.merging.insert(2);
+        assert!(!app.can_merge(&app.prs[1]));
+        press(&mut app, 'm');
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn merged_pr_leaves_the_list_even_if_search_still_lists_it() {
+        let mut app = app_with(vec![ready_pr(1, "a"), ready_pr(2, "b"), ready_pr(3, "c")]);
+        app.select(1);
+        app.merging.insert(2);
+        // Keep the refresh the merge triggers from spawning `gh`.
+        app.loading_since = Some(Instant::now());
+        app.on_msg(Msg::Merged(2, Ok(true)));
+        assert!(app.merging.is_empty());
+        assert_eq!(
+            app.prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert_eq!(app.selected_pr().unwrap().number, 3);
+        assert_eq!(app.flash().unwrap().text, "Merged #2");
+
+        app.on_msg(snapshot(vec![ready_pr(1, "a"), ready_pr(2, "b")]));
+        assert_eq!(app.prs.iter().map(|pr| pr.number).collect::<Vec<_>>(), [1]);
+        assert_eq!(app.merged, HashSet::from([2]));
+        // Once search catches up, the number is forgotten.
+        app.on_msg(snapshot(vec![ready_pr(1, "a")]));
+        assert!(app.merged.is_empty());
+    }
+
+    #[test]
+    fn queued_or_failed_merge_keeps_the_pr() {
+        let mut app = app_with(vec![ready_pr(1, "a")]);
+        app.loading_since = Some(Instant::now());
+        app.merging.insert(1);
+        app.on_msg(Msg::Merged(1, Ok(false)));
+        assert_eq!(app.prs.len(), 1);
+        assert_eq!(app.flash().unwrap().text, "Added #1 to the merge queue");
+
+        app.merging.insert(1);
+        app.on_msg(Msg::Merged(
+            1,
+            Err(anyhow::anyhow!("Head branch was modified")),
+        ));
+        assert_eq!(app.prs.len(), 1);
+        assert!(app.flash().unwrap().is_error);
+        assert!(app.flash().unwrap().text.contains("was modified"));
+        assert!(app.can_merge(&app.prs[0]));
     }
 
     #[test]
@@ -922,6 +1087,7 @@ pub(crate) mod tests {
             Ok(PrSnapshot {
                 prs: vec![sample_pr(3, "a")],
                 claude_review_label: None,
+                merge_method: MergeMethod::Merge,
             }),
             worktrees,
         ));
@@ -998,7 +1164,7 @@ pub(crate) mod tests {
         let mut app = app_with(vec![]);
         app.claude_review_label = Some(claude_label());
         app.set_worktrees(vec![sample_worktree("me/a", Progress::Empty)]);
-        for key in ['o', 'c', 'l'] {
+        for key in ['o', 'c', 'l', 'm'] {
             press(&mut app, key);
         }
         press_key(&mut app, KeyCode::Enter);

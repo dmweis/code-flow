@@ -6,18 +6,19 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::model::{
-    AutoMerge, CLAUDE_REVIEW_LABEL, Ci, CiState, Label, Merge, PullRequest, Review,
+    AutoMerge, CLAUDE_REVIEW_LABEL, Ci, CiState, Label, Merge, MergeMethod, PullRequest, Review,
 };
 
 const QUERY: &str = r#"
 query($q: String!, $owner: String!, $name: String!, $label: String!) {
   repository(owner: $owner, name: $name) {
     label(name: $label) { name color }
+    viewerDefaultMergeMethod
   }
   search(query: $q, type: ISSUE, first: 100) {
     nodes {
       ... on PullRequest {
-        number title body isDraft headRefName baseRefName
+        number title body isDraft headRefName headRefOid baseRefName
         reviewDecision mergeable mergeStateStatus
         isInMergeQueue mergeQueueEntry { position }
         autoMergeRequest { enabledAt }
@@ -172,6 +173,32 @@ pub fn add_claude_review(repo: &str, number: u64) -> Result<()> {
     Ok(())
 }
 
+/// Merges the PR with `method`, but only if its head is still `head_oid`, so
+/// commits pushed since the last refresh aren't merged unseen. Returns whether
+/// it's merged now; with a merge queue, gh queues it instead.
+pub fn merge(repo: &str, number: u64, method: MergeMethod, head_oid: &str) -> Result<bool> {
+    let number = number.to_string();
+    let method = match method {
+        MergeMethod::Merge => "--merge",
+        MergeMethod::Squash => "--squash",
+        MergeMethod::Rebase => "--rebase",
+    };
+    gh(&[
+        "pr",
+        "merge",
+        &number,
+        "--repo",
+        repo,
+        method,
+        "--match-head-commit",
+        head_oid,
+    ])?;
+    let output = gh(&[
+        "pr", "view", &number, "--repo", repo, "--json", "state", "--jq", ".state",
+    ])?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "MERGED")
+}
+
 pub enum Checkout {
     Done(String),
     /// The existing local branch and the PR have diverged, typically because
@@ -223,14 +250,20 @@ pub fn open_in_browser(repo: &str, number: u64) -> Result<()> {
 pub struct PrSnapshot {
     pub prs: Vec<PullRequest>,
     pub claude_review_label: Option<Label>,
+    /// The method GitHub preselects for you in this repository.
+    pub merge_method: MergeMethod,
 }
 
 fn parse_response(json: &[u8]) -> Result<PrSnapshot> {
     let response: Response =
         serde_json::from_slice(json).context("unexpected response from GitHub")?;
-    let claude_review_label = response
-        .data
-        .repository
+    let repository = response.data.repository;
+    let merge_method = match repository.viewer_default_merge_method.as_str() {
+        "SQUASH" => MergeMethod::Squash,
+        "REBASE" => MergeMethod::Rebase,
+        _ => MergeMethod::Merge,
+    };
+    let claude_review_label = repository
         .label
         .map(Label::from)
         .filter(|label| label.name == CLAUDE_REVIEW_LABEL);
@@ -244,6 +277,7 @@ fn parse_response(json: &[u8]) -> Result<PrSnapshot> {
     Ok(PrSnapshot {
         prs,
         claude_review_label,
+        merge_method,
     })
 }
 
@@ -259,8 +293,10 @@ struct Data {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawRepository {
     label: Option<RawLabel>,
+    viewer_default_merge_method: String,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +312,7 @@ struct RawPr {
     body: String,
     is_draft: bool,
     head_ref_name: String,
+    head_ref_oid: String,
     base_ref_name: String,
     review_decision: Option<String>,
     mergeable: String,
@@ -374,6 +411,7 @@ impl From<RawPr> for PullRequest {
             body: clean_body(&raw.body),
             title: raw.title,
             head: raw.head_ref_name,
+            head_oid: raw.head_ref_oid,
             base: raw.base_ref_name,
             is_draft: raw.is_draft,
         }
@@ -447,11 +485,13 @@ fn ci_status(rollup: Option<&RawRollup>) -> Ci {
     }
 }
 
+/// `HAS_HOOKS` is `CLEAN` on GitHub Enterprise with pre-receive hooks.
 fn merge_status(mergeable: &str, merge_state_status: &str) -> Merge {
     match (mergeable, merge_state_status) {
         ("CONFLICTING", _) | (_, "DIRTY") => Merge::Conflicts,
         (_, "BEHIND") => Merge::Behind,
         ("UNKNOWN", _) => Merge::Unknown,
+        ("MERGEABLE", "CLEAN" | "HAS_HOOKS") => Merge::Ready,
         _ => Merge::Clean,
     }
 }
@@ -493,7 +533,8 @@ mod tests {
             ),
         ] {
             let response = serde_json::json!({"data": {
-                "repository": {"label": label}, "search": {"nodes": []}
+                "repository": {"label": label, "viewerDefaultMergeMethod": "MERGE"},
+                "search": {"nodes": []}
             }});
             let snapshot = parse_response(response.to_string().as_bytes()).unwrap();
             assert_eq!(snapshot.claude_review_label.is_some(), expected);
@@ -520,7 +561,8 @@ mod tests {
         let mut node: serde_json::Value = serde_json::from_str(
             r#"{
                 "number": 1, "title": "t", "body": "",
-                "isDraft": false, "headRefName": "feature", "baseRefName": "main",
+                "isDraft": false, "headRefName": "feature", "headRefOid": "abc123",
+                "baseRefName": "main",
                 "reviewDecision": null, "mergeable": "MERGEABLE",
                 "mergeStateStatus": "CLEAN", "isInMergeQueue": false,
                 "mergeQueueEntry": null, "autoMergeRequest": null,
@@ -535,7 +577,8 @@ mod tests {
             node[key] = value.clone();
         }
         let response = serde_json::json!({"data": {
-            "repository": {"label": null}, "search": {"nodes": [node]}
+            "repository": {"label": null, "viewerDefaultMergeMethod": "MERGE"},
+            "search": {"nodes": [node]}
         }});
         parse_response(response.to_string().as_bytes())
             .unwrap()
@@ -555,13 +598,14 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_ready_needs_review_no_ci_clean() {
+    fn defaults_to_ready_needs_review_no_ci_mergeable() {
         let pr = pr(r#""number": 7"#);
         assert_eq!(pr.number, 7);
+        assert_eq!(pr.head_oid, "abc123");
         assert!(!pr.is_draft);
         assert_eq!(pr.review, Review::Required);
         assert_eq!(pr.ci.state, CiState::None);
-        assert_eq!(pr.merge, Merge::Clean);
+        assert_eq!(pr.merge, Merge::Ready);
         assert_eq!(pr.auto_merge, AutoMerge::Off);
         assert_eq!(pr.unresolved_threads, 0);
     }
@@ -662,6 +706,46 @@ mod tests {
             Merge::Unknown
         );
         assert_eq!(pr(r#""mergeStateStatus": "BLOCKED""#).merge, Merge::Clean);
+        assert_eq!(pr(r#""mergeStateStatus": "UNSTABLE""#).merge, Merge::Clean);
+        assert_eq!(pr(r#""mergeStateStatus": "HAS_HOOKS""#).merge, Merge::Ready);
+        // GitHub may not have computed mergeability yet.
+        assert_eq!(
+            pr(r#""mergeable": "UNKNOWN", "mergeStateStatus": "CLEAN""#).merge,
+            Merge::Unknown
+        );
+    }
+
+    #[test]
+    fn ready_to_merge_needs_more_than_a_clean_merge_state() {
+        // Without required reviews, an unreviewed PR is ready.
+        assert!(pr("").is_ready_to_merge());
+        // Captured from a draft on github.com: its merge state is still CLEAN.
+        assert!(!pr(r#""isDraft": true"#).is_ready_to_merge());
+        assert!(!pr(r#""mergeStateStatus": "BLOCKED""#).is_ready_to_merge());
+        let changes = r#""latestReviews": {"nodes": [{"state": "CHANGES_REQUESTED"}]}"#;
+        assert!(!pr(changes).is_ready_to_merge());
+        let failed = rollup("FAILURE", 1, r#"{"state": "FAILURE", "count": 1}"#, "");
+        assert!(!pr(&failed).is_ready_to_merge());
+        let passed = rollup("SUCCESS", 1, r#"{"state": "SUCCESS", "count": 1}"#, "");
+        assert!(pr(&passed).is_ready_to_merge());
+        let auto = r#""autoMergeRequest": {"enabledAt": "2026-09-13T00:00:00Z"}"#;
+        assert!(!pr(auto).is_ready_to_merge());
+    }
+
+    #[test]
+    fn reads_default_merge_method() {
+        for (raw, expected) in [
+            ("SQUASH", MergeMethod::Squash),
+            ("REBASE", MergeMethod::Rebase),
+            ("MERGE", MergeMethod::Merge),
+        ] {
+            let response = serde_json::json!({"data": {
+                "repository": {"label": null, "viewerDefaultMergeMethod": raw},
+                "search": {"nodes": []}
+            }});
+            let snapshot = parse_response(response.to_string().as_bytes()).unwrap();
+            assert_eq!(snapshot.merge_method, expected);
+        }
     }
 
     #[test]
