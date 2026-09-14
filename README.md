@@ -15,6 +15,63 @@ cargo install --path .
 
 Then run `code-flow` from inside a clone of a GitHub repository.
 
+If you have [just](https://just.systems), the [justfile](justfile) wraps the
+steps below: `just install` installs code-flow, `just install-tools` installs
+worktrunk and Herdr for your OS, `just install-skills` installs their agent
+skills, and `just install-all` does all three. Run `just` to list every recipe.
+
+### Optional: worktrunk and Herdr
+
+The `w` and `W` keys use [worktrunk](https://worktrunk.dev) (`wt`) to manage
+PR worktrees, and [Herdr](https://herdr.dev) to open a workspace for each one.
+Both are optional; everything else works without them.
+
+#### macOS
+
+Both are in Homebrew:
+
+```sh
+brew install worktrunk herdr
+wt config shell install
+```
+
+#### Ubuntu
+
+Install worktrunk with Cargo, which you already have from installing code-flow:
+
+```sh
+cargo install worktrunk
+wt config shell install
+```
+
+Install Herdr with its install script, which puts `herdr` on your `PATH`:
+
+```sh
+curl -fsSL https://herdr.dev/install.sh | sh
+```
+
+If you use [Homebrew on Linux](https://docs.brew.sh/Homebrew-on-Linux), the
+macOS instructions work too.
+
+`wt config shell install` adds shell integration so `wt switch` can change your
+directory; restart your shell afterwards. To get Herdr workspaces, run
+`code-flow` from inside Herdr. Keep them up to date with `brew upgrade` on
+macOS, and with `cargo install worktrunk` and `herdr update` on Ubuntu.
+
+#### Agent skills
+
+The Herdr skill and the worktrunk plugin teach coding agents to use these
+tools. The commands are the same on macOS and Ubuntu. The Herdr skill needs
+Node.js for `npx`; the worktrunk plugin needs the [Claude Code](https://claude.com/claude-code) CLI:
+
+```sh
+npx skills add herdrdev/herdr --skill herdr -g
+wt config plugins claude install
+```
+
+`npx skills` asks which agents to install the Herdr skill for. For the
+worktrunk plugin in Codex, run `wt config plugins codex install` instead.
+
 ## Statuses
 
 Each PR takes two lines: its number, title and labels, then short status
