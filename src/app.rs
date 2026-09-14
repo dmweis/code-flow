@@ -312,7 +312,9 @@ impl App {
         let default_branch = self.default_branch.clone();
         self.pulling = true;
         self.set_flash(format!("Pulling {default_branch} from origin…"), false);
-        self.spawn(move || Msg::PulledDefaultBranch(github::pull_default_branch(&default_branch)));
+        self.spawn(move || {
+            Msg::PulledDefaultBranch(github::pull_default_branch(".", &default_branch))
+        });
     }
 
     fn refresh_worktrees(&self) {
@@ -841,7 +843,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn unloaded_app() -> App {
+    pub fn unloaded_app() -> App {
         let (tx, _rx) = mpsc::channel();
         let repo = Repo {
             name: "o/r".into(),
@@ -858,7 +860,7 @@ pub(crate) mod tests {
         app
     }
 
-    fn press(app: &mut App, c: char) {
+    pub fn press(app: &mut App, c: char) {
         app.on_key(KeyEvent::from(KeyCode::Char(c)));
     }
 
@@ -1367,6 +1369,185 @@ pub(crate) mod tests {
             flash.text,
             "Didn't pull main: your main has commits origin/main doesn't, so it can't fast-forward"
         );
+    }
+
+    #[test]
+    fn failed_first_load_shows_the_error_without_a_flash() {
+        let mut app = unloaded_app();
+        app.on_msg(Msg::Prs(
+            Err(anyhow::anyhow!("gh: not logged in")),
+            Vec::new(),
+        ));
+        assert_eq!(app.load_error.as_deref(), Some("gh: not logged in"));
+        assert!(app.flash().is_none());
+        assert!(app.last_success.is_none());
+
+        app.on_msg(snapshot(vec![sample_pr(1, "a")]));
+        assert!(app.load_error.is_none());
+        assert_eq!(app.selected_pr().unwrap().number, 1);
+    }
+
+    #[test]
+    fn failed_refresh_keeps_the_prs_and_flashes_the_error() {
+        let mut app = app_with(vec![sample_pr(1, "a"), sample_pr(2, "b")]);
+        app.select(1);
+        app.on_msg(Msg::Prs(Err(anyhow::anyhow!("timed out")), Vec::new()));
+        assert_eq!(app.prs.len(), 2);
+        assert_eq!(app.selected_pr().unwrap().number, 2);
+        assert_eq!(app.load_error.as_deref(), Some("timed out"));
+        let flash = app.flash().unwrap();
+        assert!(flash.is_error);
+        assert_eq!(flash.text, "Refresh failed: timed out");
+    }
+
+    #[test]
+    fn refresh_is_due_a_minute_after_the_last_attempt() {
+        let mut app = app_with(vec![]);
+        // The first fetch starts in `run`, not on a timer.
+        assert!(!app.refresh_due());
+        app.last_attempt = Some(Instant::now());
+        assert!(!app.refresh_due());
+        app.last_attempt = Some(Instant::now() - REFRESH_INTERVAL);
+        assert!(app.refresh_due());
+        // Not while one is still running.
+        app.loading_since = Some(Instant::now());
+        assert!(!app.refresh_due());
+    }
+
+    #[test]
+    fn flash_expires() {
+        let mut app = app_with(vec![]);
+        app.set_flash("Merged #1", false);
+        assert!(app.flash().is_some());
+        app.flash.as_mut().unwrap().at -= FLASH_DURATION;
+        assert!(app.flash().is_none());
+    }
+
+    #[test]
+    fn help_closes_on_any_key_without_acting_on_it() {
+        let mut app = app_with(vec![sample_pr(1, "a"), sample_pr(2, "b")]);
+        press(&mut app, '?');
+        assert!(app.show_help);
+        press(&mut app, 'j');
+        assert!(!app.show_help);
+        assert_eq!(app.list.selected(), Some(0));
+
+        press(&mut app, '?');
+        press(&mut app, 'q');
+        assert!(!app.show_help);
+        assert!(!app.should_quit);
+        press(&mut app, 'q');
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_anywhere() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut app = app_with(vec![sample_pr(1, "a")]);
+        app.prompt = Some(Prompt::ForceCheckout {
+            number: 1,
+            branch: "feature".into(),
+        });
+        app.on_key(ctrl_c);
+        assert!(app.should_quit);
+
+        let mut app = app_with(vec![]);
+        press(&mut app, 'n');
+        app.on_key(ctrl_c);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn esc_quits() {
+        let mut app = app_with(vec![]);
+        press_key(&mut app, KeyCode::Esc);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn new_branch_input_ignores_ctrl_and_alt_keys() {
+        let mut app = app_with(vec![]);
+        press(&mut app, 'n');
+        press(&mut app, 'x');
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        // Shift is how capitals arrive.
+        app.on_key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT));
+        assert_eq!(app.new_branch.as_deref(), Some("xY"));
+    }
+
+    #[test]
+    fn description_scroll_is_bounded_and_resets_on_a_new_row() {
+        let mut app = app_with(vec![sample_pr(1, "a"), sample_pr(2, "b")]);
+        for _ in 0..3 {
+            press(&mut app, 'J');
+        }
+        assert_eq!(app.detail_scroll, 9);
+        for _ in 0..4 {
+            press(&mut app, 'K');
+        }
+        assert_eq!(app.detail_scroll, 0);
+        press_key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.detail_scroll, 10);
+        press_key(&mut app, KeyCode::PageUp);
+        press_key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.detail_scroll, 0);
+
+        press(&mut app, 'J');
+        // Already at the top: same row, so the scroll stays.
+        press(&mut app, 'k');
+        assert_eq!(app.detail_scroll, 3);
+        press(&mut app, 'j');
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn reports_checkout_and_worktree_removal() {
+        let mut app = app_with(vec![sample_pr(3, "a")]);
+        app.on_msg(Msg::CheckedOut(3, Ok(Checkout::Done(String::new()))));
+        assert_eq!(app.flash().unwrap().text, "Checked out #3");
+        let done = Checkout::Done("Switched to branch 'feature'".into());
+        app.on_msg(Msg::CheckedOut(3, Ok(done)));
+        assert_eq!(
+            app.flash().unwrap().text,
+            "Checked out #3: Switched to branch 'feature'"
+        );
+
+        app.on_msg(Msg::RemovedWorktree("PR #3".into(), Ok(true)));
+        assert_eq!(
+            app.flash().unwrap().text,
+            "Removed the worktree for PR #3 and closed its Herdr workspace"
+        );
+        app.on_msg(Msg::RemovedWorktree("me/a".into(), Ok(false)));
+        assert_eq!(app.flash().unwrap().text, "Removed the worktree for me/a");
+        assert!(!app.flash().unwrap().is_error);
+
+        let err = anyhow::anyhow!("`wt remove` failed: Cannot remove worktree");
+        app.on_msg(Msg::RemovedWorktree("me/a".into(), Err(err)));
+        assert!(app.flash().unwrap().is_error);
+    }
+
+    #[test]
+    fn failing_to_list_worktrees_keeps_the_last_list() {
+        let mut app = app_with(vec![]);
+        app.on_msg(Msg::Worktrees(Ok(vec![sample_worktree(
+            "me/a",
+            Progress::Empty,
+        )])));
+        app.on_msg(Msg::Worktrees(Err(anyhow::anyhow!("wt crashed"))));
+        assert_eq!(app.worktrees.len(), 1);
+        assert!(app.flash().is_none());
+    }
+
+    #[test]
+    fn reports_pulling_after_the_branch_changed() {
+        let mut app = app_with(vec![]);
+        app.pulling = true;
+        app.on_msg(Msg::PulledDefaultBranch(Ok(None)));
+        assert!(!app.pulling);
+        let flash = app.flash().unwrap();
+        assert!(!flash.is_error);
+        assert_eq!(flash.text, "Not on main, so nothing was pulled");
     }
 
     #[test]

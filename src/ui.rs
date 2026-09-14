@@ -377,7 +377,11 @@ fn status_badges(
     }
     let ci = match pr.ci.state {
         CiState::None => "no CI".to_owned(),
-        CiState::Running => format!("CI {}/{}", pr.ci.total - pr.ci.pending, pr.ci.total),
+        CiState::Running => format!(
+            "CI {}/{}",
+            pr.ci.total.saturating_sub(pr.ci.pending),
+            pr.ci.total
+        ),
         CiState::Passed => "CI passed".to_owned(),
         CiState::Failed if pr.ci.failed == 0 => "CI failed".to_owned(),
         CiState::Failed => format!("CI {} failed", pr.ci.failed),
@@ -757,7 +761,10 @@ fn ci_text(ci: Ci) -> String {
     let checks = if total == 1 { "check" } else { "checks" };
     match ci.state {
         CiState::None => "No CI checks".into(),
-        CiState::Running => format!("CI running ({}/{total} done)", total - pending),
+        CiState::Running => format!(
+            "CI running ({}/{total} done)",
+            total.saturating_sub(pending)
+        ),
         CiState::Passed => format!("CI passed ({total} {checks})"),
         CiState::Failed if failed == 0 => "CI failed".into(),
         CiState::Failed if pending > 0 => {
@@ -812,7 +819,9 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::app::tests::{app_with, claude_label, ready_pr, sample_pr, sample_worktree};
+    use crate::app::tests::{
+        app_with, claude_label, press, ready_pr, sample_pr, sample_worktree, unloaded_app,
+    };
 
     fn render(app: &mut App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(150, 24)).unwrap();
@@ -1122,6 +1131,200 @@ mod tests {
 
         app.pulling = true;
         assert!(!render(&mut app).contains("pull main"));
+    }
+
+    #[test]
+    fn renders_loading_and_load_errors() {
+        let mut app = unloaded_app();
+        assert!(render(&mut app).contains("Loading…"));
+
+        app.load_error = Some("gh: not logged in".into());
+        let screen = render(&mut app);
+        assert!(screen.contains("gh: not logged in"), "{screen}");
+        assert!(screen.contains("refresh failed"), "{screen}");
+        assert!(!screen.contains("Loading…"), "{screen}");
+    }
+
+    #[test]
+    fn flash_replaces_the_key_hints() {
+        let mut app = app_with(vec![sample_pr(1, "a")]);
+        assert!(render(&mut app).contains(" r refresh "));
+        press(&mut app, 'W');
+        let screen = render(&mut app);
+        assert!(screen.contains(" PR #1 has no worktree"), "{screen}");
+        assert!(!screen.contains(" r refresh "), "{screen}");
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_end_of_the_description() {
+        let mut pr = sample_pr(1, "a");
+        pr.body = (1..=100).map(|n| format!("line {n}\n")).collect();
+        let mut app = app_with(vec![pr]);
+        app.detail_scroll = 1000;
+        let screen = render(&mut app);
+        assert!(screen.contains("line 100"), "{screen}");
+        assert!(!screen.contains("line 50 "), "{screen}");
+        // Stored back, so K scrolls up straight away.
+        let bottom = app.detail_scroll;
+        assert!(bottom < 100, "{bottom}");
+        press(&mut app, 'K');
+        render(&mut app);
+        assert_eq!(app.detail_scroll, bottom - 3);
+    }
+
+    #[test]
+    fn renders_a_missing_description() {
+        let mut pr = sample_pr(1, "a");
+        pr.body = String::new();
+        let mut app = app_with(vec![pr]);
+        assert!(render(&mut app).contains("No description provided."));
+    }
+
+    #[test]
+    fn renders_at_any_terminal_size() {
+        let mut pr = sample_pr(1, "A long title that has to wrap somewhere");
+        pr.body = "line\n".repeat(50);
+        let mut app = app_with(vec![pr]);
+        app.worktrees
+            .push(sample_worktree("feature", Progress::Ahead(1)));
+        app.show_help = true;
+        app.prompt = Some(Prompt::ForceCheckout {
+            number: 1,
+            branch: "feature".into(),
+        });
+        app.new_branch = Some("x".into());
+        for width in 0..30 {
+            for height in 0..12 {
+                app.detail_scroll = 1000;
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn more_pending_checks_than_total_does_not_underflow() {
+        let mut pr = sample_pr(1, "a");
+        pr.ci.total = 2;
+        pr.ci.pending = 3;
+        let text: Vec<_> = status_badges(&pr, false, None, false)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(text.contains(&"⟳ CI 0/2".to_owned()), "{text:?}");
+        assert_eq!(ci_text(pr.ci), "CI running (0/2 done)");
+    }
+
+    #[test]
+    fn describes_ci_in_full() {
+        let ci = |state, total, pending, failed| Ci {
+            state,
+            total,
+            pending,
+            failed,
+        };
+        assert_eq!(ci_text(ci(CiState::None, 0, 0, 0)), "No CI checks");
+        assert_eq!(
+            ci_text(ci(CiState::Running, 7, 4, 0)),
+            "CI running (3/7 done)"
+        );
+        assert_eq!(ci_text(ci(CiState::Passed, 1, 0, 0)), "CI passed (1 check)");
+        assert_eq!(
+            ci_text(ci(CiState::Passed, 7, 0, 0)),
+            "CI passed (7 checks)"
+        );
+        // The rollup failed without a count saying which.
+        assert_eq!(ci_text(ci(CiState::Failed, 2, 0, 0)), "CI failed");
+        assert_eq!(
+            ci_text(ci(CiState::Failed, 5, 2, 1)),
+            "CI failed (1 failed, 2 still running)"
+        );
+        assert_eq!(
+            ci_text(ci(CiState::Failed, 1, 0, 1)),
+            "CI failed (1 of 1 check)"
+        );
+        assert_eq!(
+            ci_text(ci(CiState::Failed, 5, 0, 2)),
+            "CI failed (2 of 5 checks)"
+        );
+    }
+
+    #[test]
+    fn list_badges_for_remaining_states() {
+        let mut pr = ready_pr(1, "a");
+        pr.unresolved_threads = 0;
+        pr.ci.state = CiState::Failed;
+        pr.ci.failed = 0;
+        pr.auto_merge = AutoMerge::Queued { position: None };
+        let text: Vec<_> = status_badges(&pr, true, None, false)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(
+            text,
+            ["✓ approved", "✗ CI failed", "≡ queued", "⌂ worktree"]
+        );
+    }
+
+    #[test]
+    fn describes_auto_merge() {
+        assert_eq!(auto_merge_text(AutoMerge::Off), None);
+        assert_eq!(
+            auto_merge_text(AutoMerge::Enabled).as_deref(),
+            Some("Auto-merge enabled")
+        );
+        let queued = |position| auto_merge_text(AutoMerge::Queued { position });
+        assert_eq!(
+            queued(Some(2)).as_deref(),
+            Some("In merge queue (position 2)")
+        );
+        assert_eq!(queued(None).as_deref(), Some("In merge queue"));
+    }
+
+    #[test]
+    fn uses_singular_for_one_commit() {
+        assert_eq!(
+            branch_fate(Some(Progress::Ahead(1))),
+            "The branch has 1 unmerged commit, so it's kept."
+        );
+        assert_eq!(branch_fate(None), "The branch is kept unless it's merged.");
+        assert_eq!(
+            progress_text(Progress::Ahead(1), "main"),
+            "1 commit not in main"
+        );
+        let worktree = sample_worktree("me/a", Progress::Ahead(1));
+        let badges: Vec<_> = local_badges(&worktree)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(badges, ["↑ 1 commit"]);
+    }
+
+    #[test]
+    fn formats_age_in_seconds_then_minutes() {
+        assert_eq!(format_age(Duration::from_secs(0)), "0s");
+        assert_eq!(format_age(Duration::from_secs(59)), "59s");
+        assert_eq!(format_age(Duration::from_secs(60)), "1m");
+        assert_eq!(format_age(Duration::from_secs(3599)), "59m");
+    }
+
+    #[test]
+    fn label_chips_pick_readable_text_and_skip_claude_review() {
+        let label = |name: &str, rgb| Label {
+            name: name.into(),
+            rgb,
+        };
+        let labels = [
+            label("bug", (0xd7, 0x3a, 0x4a)),
+            label("claude-review", (0xaa, 0xbb, 0xcc)),
+            label("docs", (0xfb, 0xca, 0x04)),
+        ];
+        let chips = label_chips(&labels);
+        let text: Vec<_> = chips.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, [" bug ", " ", " docs "]);
+        assert_eq!(chips[0].style.fg, Some(Color::White));
+        assert_eq!(chips[2].style.fg, Some(Color::Black));
+        assert!(label_chips(&labels[1..2]).is_empty());
     }
 
     #[test]

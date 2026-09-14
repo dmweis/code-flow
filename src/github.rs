@@ -59,11 +59,16 @@ const FAILED_STATES: &[&str] = &[
     "ACTION_REQUIRED",
 ];
 
-/// Runs a command, returning its output whether or not it succeeded. Messages
-/// are forced to English so git's errors can be recognized.
 fn run(program: &str, args: &[&str]) -> Result<Output> {
+    run_in(".", program, args)
+}
+
+/// Runs a command in `dir`, returning its output whether or not it succeeded.
+/// Messages are forced to English so git's errors can be recognized.
+fn run_in(dir: &str, program: &str, args: &[&str]) -> Result<Output> {
     Command::new(program)
         .args(args)
+        .current_dir(dir)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .output()
@@ -92,15 +97,15 @@ fn git(args: &[&str]) -> Result<String> {
 
 /// Runs git in `dir`, returning its trimmed stdout.
 pub fn git_in(dir: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .output()
-        .context("failed to run `git`; is it installed and on PATH?")?;
-    let output = check("git", args, output)?;
+    let output = check("git", args, run_in(dir, "git", args)?)?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Whether tracked files in `dir` have changes, staged or not, that aren't
+/// committed. Untracked files don't count.
+pub fn has_uncommitted_changes(dir: &str) -> Result<bool> {
+    let status = git_in(dir, &["status", "--porcelain", "--untracked-files=no"])?;
+    Ok(!status.is_empty())
 }
 
 /// The last line of a command's stderr, where git reports the branch switch.
@@ -224,7 +229,7 @@ pub fn checkout(repo: &str, number: u64) -> Result<Checkout> {
 /// When the branch is already checked out, `gh pr checkout --force` runs
 /// `git reset --hard`, so refuse if tracked files have uncommitted changes.
 pub fn force_checkout(repo: &str, number: u64) -> Result<()> {
-    if !git(&["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
+    if has_uncommitted_changes(".")? {
         bail!("You have uncommitted changes; commit or stash them, then check out again");
     }
     gh(&[
@@ -247,20 +252,20 @@ pub fn current_branch() -> Result<String> {
     git(&["branch", "--show-current"])
 }
 
-/// Fast-forwards the default branch to `origin` if it's checked out here,
+/// Fast-forwards the default branch to `origin` if it's checked out in `dir`,
 /// returning how many commits came in, or `None` on any other branch.
 ///
 /// Never merges, rebases or resets: when local commits have diverged or
 /// uncommitted changes would be overwritten, git refuses and this fails.
-pub fn pull_default_branch(default_branch: &str) -> Result<Option<u32>> {
-    if current_branch()? != default_branch {
+pub fn pull_default_branch(dir: &str, default_branch: &str) -> Result<Option<u32>> {
+    if git_in(dir, &["branch", "--show-current"])? != default_branch {
         return Ok(None);
     }
-    git(&["fetch", "origin", default_branch])?;
-    let before = git(&["rev-parse", "HEAD"])?;
+    git_in(dir, &["fetch", "origin", default_branch])?;
+    let before = git_in(dir, &["rev-parse", "HEAD"])?;
     let upstream = format!("origin/{default_branch}");
     let args = ["merge", "--ff-only", &upstream];
-    let output = run("git", &args)?;
+    let output = run_in(dir, "git", &args)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if is_diverged(&stderr) {
@@ -271,7 +276,7 @@ pub fn pull_default_branch(default_branch: &str) -> Result<Option<u32>> {
         }
     }
     check("git", &args, output)?;
-    let count = git(&["rev-list", "--count", &format!("{before}..HEAD")])?;
+    let count = git_in(dir, &["rev-list", "--count", &format!("{before}..HEAD")])?;
     Ok(Some(
         count
             .parse()
@@ -554,6 +559,10 @@ fn clean_body(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{env, fs, process};
+
     use super::*;
 
     #[test]
@@ -840,5 +849,200 @@ mod tests {
     fn cleans_body() {
         let body = "<!-- template hint -->\r\nFixes the thing.\r\n\tIndented<!-- unterminated";
         assert_eq!(clean_body(body), "Fixes the thing.\n    Indented");
+    }
+
+    #[test]
+    fn ci_without_counts_goes_by_the_rollup_state() {
+        let without_counts = |state: &str| {
+            let rollup = format!(
+                r#""commits": {{"nodes": [{{"commit": {{"statusCheckRollup": {{
+                    "state": "{state}",
+                    "contexts": {{"totalCount": 2,
+                        "checkRunCountsByState": null,
+                        "statusContextCountsByState": null}}
+                }}}}}}]}}"#
+            );
+            pr(&rollup).ci
+        };
+        let ci = without_counts("SUCCESS");
+        assert_eq!((ci.state, ci.total), (CiState::Passed, 2));
+        // Failed or running with no count saying which.
+        assert_eq!(
+            without_counts("FAILURE"),
+            Ci {
+                state: CiState::Failed,
+                total: 2,
+                pending: 0,
+                failed: 0
+            }
+        );
+        assert_eq!(without_counts("ERROR").state, CiState::Failed);
+        assert_eq!(without_counts("EXPECTED").state, CiState::Running);
+        // A PR with no commits has no rollup at all.
+        assert_eq!(pr(r#""commits": {"nodes": []}"#).ci.state, CiState::None);
+    }
+
+    /// A throwaway directory, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let name = format!("code-flow-test-{}-{n}", process::id());
+            let path = env::temp_dir().join(name);
+            fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Runs git to set up a test, ignoring the user's git config so settings
+    /// like commit signing can't get in the way.
+    fn setup_git(dir: &str, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "git {args:?} failed: {stderr}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn write(dir: &str, file: &str, content: &str) {
+        fs::write(Path::new(dir).join(file), content).unwrap();
+    }
+
+    fn commit(dir: &str, file: &str, content: &str) {
+        write(dir, file, content);
+        setup_git(dir, &["add", file]);
+        setup_git(dir, &["commit", "--quiet", "--message", file]);
+    }
+
+    fn head(dir: &str) -> String {
+        setup_git(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// Your clone of a local `origin` with one commit on `main`, and a second
+    /// clone standing in for someone else pushing to it.
+    struct Repos {
+        local: String,
+        other: String,
+        _root: TempDir,
+    }
+
+    impl Repos {
+        fn new() -> Self {
+            let root = TempDir::new();
+            let path = |name: &str| root.0.join(name).to_str().unwrap().to_owned();
+            let (local, origin, other) = (path("local"), path("origin.git"), path("other"));
+            let root_path = path("");
+            setup_git(
+                &root_path,
+                &["init", "--quiet", "--initial-branch=main", &local],
+            );
+            commit(&local, "a.txt", "one");
+            setup_git(&root_path, &["clone", "--quiet", "--bare", &local, &origin]);
+            setup_git(&local, &["remote", "add", "origin", &origin]);
+            setup_git(&local, &["fetch", "--quiet", "origin"]);
+            setup_git(&root_path, &["clone", "--quiet", &origin, &other]);
+            Repos {
+                local,
+                other,
+                _root: root,
+            }
+        }
+
+        fn push_from_other(&self, file: &str, content: &str) {
+            commit(&self.other, file, content);
+            setup_git(&self.other, &["push", "--quiet", "origin", "main"]);
+        }
+    }
+
+    #[test]
+    fn pulls_new_commits_by_fast_forwarding() {
+        let repos = Repos::new();
+        assert_eq!(pull_default_branch(&repos.local, "main").unwrap(), Some(0));
+
+        repos.push_from_other("b.txt", "two");
+        repos.push_from_other("c.txt", "three");
+        assert_eq!(pull_default_branch(&repos.local, "main").unwrap(), Some(2));
+        assert_eq!(head(&repos.local), head(&repos.other));
+    }
+
+    #[test]
+    fn keeps_local_commits_when_origin_has_nothing_new() {
+        let repos = Repos::new();
+        commit(&repos.local, "b.txt", "mine");
+        let before = head(&repos.local);
+        assert_eq!(pull_default_branch(&repos.local, "main").unwrap(), Some(0));
+        assert_eq!(head(&repos.local), before);
+    }
+
+    #[test]
+    fn pulls_nothing_on_another_branch() {
+        let repos = Repos::new();
+        let fetched = setup_git(&repos.local, &["rev-parse", "origin/main"]);
+        repos.push_from_other("b.txt", "two");
+        setup_git(&repos.local, &["switch", "--quiet", "--create", "feature"]);
+        assert_eq!(pull_default_branch(&repos.local, "main").unwrap(), None);
+        // It didn't even fetch.
+        let after = setup_git(&repos.local, &["rev-parse", "origin/main"]);
+        assert_eq!(after, fetched);
+    }
+
+    #[test]
+    fn refuses_to_pull_into_a_diverged_default_branch() {
+        let repos = Repos::new();
+        repos.push_from_other("b.txt", "theirs");
+        commit(&repos.local, "c.txt", "mine");
+        let before = head(&repos.local);
+        let err = pull_default_branch(&repos.local, "main").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "your main has commits origin/main doesn't, so it can't fast-forward"
+        );
+        assert_eq!(head(&repos.local), before);
+    }
+
+    #[test]
+    fn refuses_to_pull_over_uncommitted_changes() {
+        let repos = Repos::new();
+        repos.push_from_other("a.txt", "theirs");
+        write(&repos.local, "a.txt", "mine, uncommitted");
+        let before = head(&repos.local);
+        let err = pull_default_branch(&repos.local, "main").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "uncommitted changes would be overwritten; commit or stash them first"
+        );
+        assert_eq!(head(&repos.local), before);
+        let content = fs::read_to_string(Path::new(&repos.local).join("a.txt")).unwrap();
+        assert_eq!(content, "mine, uncommitted");
+    }
+
+    #[test]
+    fn only_changes_to_tracked_files_are_uncommitted() {
+        let repos = Repos::new();
+        let local = &repos.local;
+        assert!(!has_uncommitted_changes(local).unwrap());
+        write(local, "untracked.txt", "new");
+        assert!(!has_uncommitted_changes(local).unwrap());
+        write(local, "a.txt", "changed");
+        assert!(has_uncommitted_changes(local).unwrap());
+        setup_git(local, &["add", "a.txt"]);
+        assert!(has_uncommitted_changes(local).unwrap());
     }
 }
