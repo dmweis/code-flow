@@ -1,7 +1,7 @@
 //! Application state, input handling, and the main event loop.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,117 @@ enum Msg {
     /// Commits fast-forwarded into the default branch, or `None` when it
     /// isn't checked out.
     PulledDefaultBranch(Result<Option<u32>>),
+}
+
+/// Background work the app asks for. Values rather than closures, so tests
+/// can check what an action does without running gh, git or wt.
+#[derive(Debug, PartialEq)]
+enum Job {
+    FetchPrs,
+    CurrentBranch,
+    ListWorktrees,
+    PullDefaultBranch,
+    AddClaudeReview {
+        number: u64,
+        label: Label,
+    },
+    Merge {
+        number: u64,
+        method: MergeMethod,
+        head_oid: String,
+    },
+    OpenInBrowser {
+        number: u64,
+    },
+    Checkout {
+        number: u64,
+    },
+    ForceCheckout {
+        number: u64,
+        branch: String,
+    },
+    OpenPr {
+        number: u64,
+        branch: String,
+    },
+    OpenBranch {
+        branch: String,
+        path: String,
+    },
+    MoveToWorktree {
+        number: u64,
+        branch: String,
+        main_path: String,
+    },
+    CreateBranch {
+        branch: String,
+    },
+    /// `subject` names what loses its worktree: "PR #3" or a branch.
+    RemoveWorktree {
+        subject: String,
+        branch: String,
+        path: String,
+    },
+}
+
+impl Job {
+    /// Does the work; blocks, so it's called on a background thread.
+    fn run(self, repo: &str, default_branch: &str) -> Msg {
+        match self {
+            Job::FetchPrs => {
+                let prs = github::fetch_my_prs(repo);
+                // Worktrees are local and optional; failing to list them only
+                // hides the worktree marker.
+                let worktrees = worktree::list_worktrees().unwrap_or_default();
+                Msg::Prs(prs, worktrees)
+            }
+            Job::CurrentBranch => Msg::Branch(github::current_branch()),
+            Job::ListWorktrees => Msg::Worktrees(worktree::list_worktrees()),
+            Job::PullDefaultBranch => {
+                Msg::PulledDefaultBranch(github::pull_default_branch(".", default_branch))
+            }
+            Job::AddClaudeReview { number, label } => {
+                Msg::ClaudeReviewAdded(number, label, github::add_claude_review(repo, number))
+            }
+            Job::Merge {
+                number,
+                method,
+                head_oid,
+            } => Msg::Merged(number, github::merge(repo, number, method, &head_oid)),
+            Job::OpenInBrowser { number } => Msg::Opened(github::open_in_browser(repo, number)),
+            Job::Checkout { number } => Msg::CheckedOut(number, github::checkout(repo, number)),
+            Job::ForceCheckout { number, branch } => {
+                let result = github::force_checkout(repo, number)
+                    .map(|()| Checkout::Done(format!("reset {branch} to match the PR")));
+                Msg::CheckedOut(number, result)
+            }
+            Job::OpenPr { number, branch } => {
+                Msg::OpenedWorktree(number, worktree::open_pr(number, &branch))
+            }
+            Job::OpenBranch { branch, path } => {
+                let result = worktree::open_branch(&branch, &path);
+                Msg::OpenedBranch(branch, result)
+            }
+            Job::MoveToWorktree {
+                number,
+                branch,
+                main_path,
+            } => {
+                let result =
+                    worktree::move_to_worktree(number, &branch, &main_path, default_branch);
+                Msg::OpenedWorktree(number, result)
+            }
+            Job::CreateBranch { branch } => {
+                let result = worktree::create(&branch, default_branch);
+                Msg::OpenedBranch(branch, result)
+            }
+            Job::RemoveWorktree {
+                subject,
+                branch,
+                path,
+            } => Msg::RemovedWorktree(subject, worktree::remove(&branch, &path)),
+        }
+    }
 }
 
 /// A selectable row: one of your open PRs, or a local worktree without one.
@@ -128,15 +239,24 @@ pub struct App {
     pub load_error: Option<String>,
     flash: Option<Flash>,
     should_quit: bool,
-    tx: Sender<Msg>,
+    /// Background work asked for since `run` last started some.
+    jobs: Vec<Job>,
 }
 
 pub fn run(terminal: &mut DefaultTerminal, repo: Repo) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    let mut app = App::new(repo, tx);
+    let mut app = App::new(repo);
     app.branch_prefix = worktree::branch_prefix();
     app.refresh();
     while !app.should_quit {
+        for job in app.take_jobs() {
+            let (tx, repo, default_branch) =
+                (tx.clone(), app.repo.clone(), app.default_branch.clone());
+            thread::spawn(move || {
+                // The receiver only goes away when the app is exiting.
+                let _ = tx.send(job.run(&repo, &default_branch));
+            });
+        }
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
         if event::poll(TICK)?
             && let Event::Key(key) = event::read()?
@@ -153,7 +273,7 @@ pub fn run(terminal: &mut DefaultTerminal, repo: Repo) -> Result<()> {
 }
 
 impl App {
-    fn new(repo: Repo, tx: Sender<Msg>) -> Self {
+    fn new(repo: Repo) -> Self {
         App {
             repo: repo.name,
             default_branch: repo.default_branch,
@@ -180,7 +300,7 @@ impl App {
             load_error: None,
             flash: None,
             should_quit: false,
-            tx,
+            jobs: Vec::new(),
         }
     }
 
@@ -229,12 +349,9 @@ impl App {
         };
         let number = pr.number;
         let label = self.claude_review_label.clone().unwrap();
-        let repo = self.repo.clone();
         self.adding_claude_review.insert(number);
         self.set_flash(format!("Adding claude-review to #{number}…"), false);
-        self.spawn(move || {
-            Msg::ClaudeReviewAdded(number, label, github::add_claude_review(&repo, number))
-        });
+        self.spawn(Job::AddClaudeReview { number, label });
     }
 
     pub fn can_merge(&self, pr: &PullRequest) -> bool {
@@ -270,12 +387,13 @@ impl App {
         });
     }
 
-    fn spawn(&self, job: impl FnOnce() -> Msg + Send + 'static) {
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            // The receiver only goes away when the app is exiting.
-            let _ = tx.send(job());
-        });
+    /// Queues background work for `run` to start.
+    fn spawn(&mut self, job: Job) {
+        self.jobs.push(job);
+    }
+
+    fn take_jobs(&mut self) -> Vec<Job> {
+        std::mem::take(&mut self.jobs)
     }
 
     fn refresh(&mut self) {
@@ -283,19 +401,12 @@ impl App {
             return;
         }
         self.loading_since = Some(Instant::now());
-        let repo = self.repo.clone();
-        self.spawn(move || {
-            let prs = github::fetch_my_prs(&repo);
-            // Worktrees are local and optional; failing to list them only
-            // hides the worktree marker.
-            let worktrees = worktree::list_worktrees().unwrap_or_default();
-            Msg::Prs(prs, worktrees)
-        });
+        self.spawn(Job::FetchPrs);
         self.refresh_branch();
     }
 
-    fn refresh_branch(&self) {
-        self.spawn(|| Msg::Branch(github::current_branch()));
+    fn refresh_branch(&mut self) {
+        self.spawn(Job::CurrentBranch);
     }
 
     /// Pulling is offered only with the default branch checked out here.
@@ -309,16 +420,16 @@ impl App {
         if !self.can_pull() {
             return;
         }
-        let default_branch = self.default_branch.clone();
         self.pulling = true;
-        self.set_flash(format!("Pulling {default_branch} from origin…"), false);
-        self.spawn(move || {
-            Msg::PulledDefaultBranch(github::pull_default_branch(".", &default_branch))
-        });
+        self.set_flash(
+            format!("Pulling {} from origin…", self.default_branch),
+            false,
+        );
+        self.spawn(Job::PullDefaultBranch);
     }
 
-    fn refresh_worktrees(&self) {
-        self.spawn(|| Msg::Worktrees(worktree::list_worktrees()));
+    fn refresh_worktrees(&mut self) {
+        self.spawn(Job::ListWorktrees);
     }
 
     fn refresh_due(&self) -> bool {
@@ -453,7 +564,7 @@ impl App {
             Msg::Branch(result) => self.current_branch = result.ok(),
             Msg::PulledDefaultBranch(result) => {
                 self.pulling = false;
-                let default_branch = &self.default_branch;
+                let default_branch = self.default_branch.clone();
                 let (text, is_error) = match result {
                     Ok(None) => {
                         // The branch changed outside code-flow.
@@ -599,15 +710,15 @@ impl App {
             KeyCode::Char('m') => self.ask_to_merge(),
             KeyCode::Char('o') | KeyCode::Enter => {
                 if let Some(pr) = self.selected_pr() {
-                    let (repo, number) = (self.repo.clone(), pr.number);
-                    self.spawn(move || Msg::Opened(github::open_in_browser(&repo, number)));
+                    let number = pr.number;
+                    self.spawn(Job::OpenInBrowser { number });
                 }
             }
             KeyCode::Char('c') => {
                 if let Some(pr) = self.selected_pr() {
-                    let (repo, number) = (self.repo.clone(), pr.number);
+                    let number = pr.number;
                     self.set_flash(format!("Checking out #{number}…"), false);
-                    self.spawn(move || Msg::CheckedOut(number, github::checkout(&repo, number)));
+                    self.spawn(Job::Checkout { number });
                 }
             }
             KeyCode::Char('n') => self.new_branch = Some(String::new()),
@@ -616,17 +727,12 @@ impl App {
                 Some(Row::Pr(pr)) => {
                     let (number, branch) = (pr.number, pr.head.clone());
                     self.set_flash(format!("Opening PR #{number} in a worktree…"), false);
-                    self.spawn(move || {
-                        Msg::OpenedWorktree(number, worktree::open_pr(number, &branch))
-                    });
+                    self.spawn(Job::OpenPr { number, branch });
                 }
                 Some(Row::Local(local)) => {
                     let (branch, path) = (local.branch.clone(), local.path.clone());
                     self.set_flash(format!("Opening {branch}…"), false);
-                    self.spawn(move || {
-                        let result = worktree::open_branch(&branch, &path);
-                        Msg::OpenedBranch(branch, result)
-                    });
+                    self.spawn(Job::OpenBranch { branch, path });
                 }
                 None => {}
             },
@@ -683,15 +789,11 @@ impl App {
     }
 
     fn create_branch(&mut self, branch: String) {
-        let default_branch = self.default_branch.clone();
         self.set_flash(
-            format!("Creating {branch} from origin/{default_branch}…"),
+            format!("Creating {branch} from origin/{}…", self.default_branch),
             false,
         );
-        self.spawn(move || {
-            let result = worktree::create(&branch, &default_branch);
-            Msg::OpenedBranch(branch, result)
-        });
+        self.spawn(Job::CreateBranch { branch });
     }
 
     fn on_prompt_key(&mut self, key: KeyEvent, prompt: Prompt) {
@@ -720,28 +822,22 @@ impl App {
     fn accept(&mut self, prompt: Prompt) {
         match prompt {
             Prompt::ForceCheckout { number, branch } => {
-                let repo = self.repo.clone();
                 self.set_flash(format!("Resetting {branch} to PR #{number}…"), false);
-                self.spawn(move || {
-                    let result = github::force_checkout(&repo, number)
-                        .map(|()| Checkout::Done(format!("reset {branch} to match the PR")));
-                    Msg::CheckedOut(number, result)
-                });
+                self.spawn(Job::ForceCheckout { number, branch });
             }
             Prompt::MoveToWorktree {
                 number,
                 branch,
                 main_path,
             } => {
-                let default_branch = self.default_branch.clone();
                 self.set_flash(
-                    format!("Switching the main checkout to {default_branch}…"),
+                    format!("Switching the main checkout to {}…", self.default_branch),
                     false,
                 );
-                self.spawn(move || {
-                    let result =
-                        worktree::move_to_worktree(number, &branch, &main_path, &default_branch);
-                    Msg::OpenedWorktree(number, result)
+                self.spawn(Job::MoveToWorktree {
+                    number,
+                    branch,
+                    main_path,
                 });
             }
             Prompt::RemoveWorktree {
@@ -750,15 +846,18 @@ impl App {
                 path,
             } => {
                 self.set_flash(format!("Removing the worktree for PR #{number}…"), false);
-                self.spawn(move || {
-                    Msg::RemovedWorktree(format!("PR #{number}"), worktree::remove(&branch, &path))
+                self.spawn(Job::RemoveWorktree {
+                    subject: format!("PR #{number}"),
+                    branch,
+                    path,
                 });
             }
             Prompt::RemoveLocal { branch, path, .. } => {
                 self.set_flash(format!("Removing the worktree for {branch}…"), false);
-                self.spawn(move || {
-                    let result = worktree::remove(&branch, &path);
-                    Msg::RemovedWorktree(branch, result)
+                self.spawn(Job::RemoveWorktree {
+                    subject: branch.clone(),
+                    branch,
+                    path,
                 });
             }
             Prompt::Merge {
@@ -767,11 +866,12 @@ impl App {
                 method,
                 ..
             } => {
-                let repo = self.repo.clone();
                 self.merging.insert(number);
                 self.set_flash(format!("Merging #{number}…"), false);
-                self.spawn(move || {
-                    Msg::Merged(number, github::merge(&repo, number, method, &head_oid))
+                self.spawn(Job::Merge {
+                    number,
+                    method,
+                    head_oid,
                 });
             }
         }
@@ -844,12 +944,11 @@ pub(crate) mod tests {
     }
 
     pub fn unloaded_app() -> App {
-        let (tx, _rx) = mpsc::channel();
         let repo = Repo {
             name: "o/r".into(),
             default_branch: "main".into(),
         };
-        let mut app = App::new(repo, tx);
+        let mut app = App::new(repo);
         app.branch_prefix = "me/".into();
         app
     }
@@ -1003,10 +1102,9 @@ pub(crate) mod tests {
         let mut app = app_with(vec![ready_pr(1, "a"), ready_pr(2, "b"), ready_pr(3, "c")]);
         app.select(1);
         app.merging.insert(2);
-        // Keep the refresh the merge triggers from spawning `gh`.
-        app.loading_since = Some(Instant::now());
         app.on_msg(Msg::Merged(2, Ok(true)));
         assert!(app.merging.is_empty());
+        assert_eq!(app.take_jobs(), [Job::FetchPrs, Job::CurrentBranch]);
         assert_eq!(
             app.prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
             [1, 3]
@@ -1025,11 +1123,11 @@ pub(crate) mod tests {
     #[test]
     fn queued_or_failed_merge_keeps_the_pr() {
         let mut app = app_with(vec![ready_pr(1, "a")]);
-        app.loading_since = Some(Instant::now());
         app.merging.insert(1);
         app.on_msg(Msg::Merged(1, Ok(false)));
         assert_eq!(app.prs.len(), 1);
         assert_eq!(app.flash().unwrap().text, "Added #1 to the merge queue");
+        assert_eq!(app.take_jobs(), [Job::FetchPrs, Job::CurrentBranch]);
 
         app.merging.insert(1);
         app.on_msg(Msg::Merged(
@@ -1040,6 +1138,39 @@ pub(crate) mod tests {
         assert!(app.flash().unwrap().is_error);
         assert!(app.flash().unwrap().text.contains("was modified"));
         assert!(app.can_merge(&app.prs[0]));
+        // The fetch the first merge started is still running.
+        assert!(app.take_jobs().is_empty());
+    }
+
+    #[test]
+    fn accepting_a_merge_sends_the_head_commit_the_prompt_was_opened_for() {
+        let mut app = app_with(vec![sample_pr(1, "a"), ready_pr(2, "b")]);
+        app.on_msg(snapshot(vec![sample_pr(1, "a"), ready_pr(2, "b")]));
+        press(&mut app, 'j');
+        press(&mut app, 'm');
+
+        // A push that lands while the prompt is open isn't what was confirmed,
+        // so GitHub must refuse the merge rather than take the new commit.
+        let mut pushed = ready_pr(2, "b");
+        pushed.head_oid = "def456".into();
+        app.on_msg(snapshot(vec![sample_pr(1, "a"), pushed]));
+        press(&mut app, 'y');
+        assert_eq!(
+            app.take_jobs(),
+            [Job::Merge {
+                number: 2,
+                method: MergeMethod::Squash,
+                head_oid: "abc123".into(),
+            }]
+        );
+        assert_eq!(app.merging, HashSet::from([2]));
+        assert_eq!(app.flash().unwrap().text, "Merging #2…");
+
+        // No second merge while that one runs.
+        press(&mut app, 'm');
+        press(&mut app, 'y');
+        assert!(app.prompt.is_none());
+        assert!(app.take_jobs().is_empty());
     }
 
     #[test]
@@ -1086,15 +1217,18 @@ pub(crate) mod tests {
         assert_eq!(app.list.selected(), Some(0));
     }
 
-    // Prompt tests only decline: accepting spawns real git, gh and wt commands.
-
-    #[test]
-    fn diverged_checkout_prompts_until_answered() {
-        let mut app = app_with(vec![sample_pr(1, "a"), sample_pr(2, "b")]);
+    fn diverged(app: &mut App) {
         let diverged = Checkout::Diverged {
             branch: "feature".into(),
         };
         app.on_msg(Msg::CheckedOut(2, Ok(diverged)));
+        assert_eq!(app.take_jobs(), [Job::CurrentBranch]);
+    }
+
+    #[test]
+    fn diverged_checkout_prompts_until_answered() {
+        let mut app = app_with(vec![sample_pr(1, "a"), sample_pr(2, "b")]);
+        diverged(&mut app);
         assert!(matches!(
             app.prompt,
             Some(Prompt::ForceCheckout { number: 2, .. })
@@ -1109,16 +1243,38 @@ pub(crate) mod tests {
         assert!(app.prompt.is_none());
         assert!(!app.should_quit);
         assert_eq!(app.flash().unwrap().text, "Kept local branch feature");
+        assert!(app.take_jobs().is_empty());
     }
 
     #[test]
-    fn branch_in_main_checkout_prompts_to_move_it() {
-        let mut app = app_with(vec![sample_pr(3, "a")]);
+    fn accepting_a_diverged_checkout_resets_the_branch() {
+        let mut app = app_with(vec![sample_pr(1, "a"), sample_pr(2, "b")]);
+        diverged(&mut app);
+        press(&mut app, 'y');
+        assert!(app.prompt.is_none());
+        assert_eq!(
+            app.take_jobs(),
+            [Job::ForceCheckout {
+                number: 2,
+                branch: "feature".into(),
+            }]
+        );
+        assert_eq!(app.flash().unwrap().text, "Resetting feature to PR #2…");
+    }
+
+    fn in_main_checkout(app: &mut App) {
         let outcome = OpenOutcome::InMainCheckout {
             branch: "feature".into(),
             path: "/src/repo".into(),
         };
         app.on_msg(Msg::OpenedWorktree(3, Ok(outcome)));
+        assert!(app.take_jobs().is_empty());
+    }
+
+    #[test]
+    fn branch_in_main_checkout_prompts_to_move_it() {
+        let mut app = app_with(vec![sample_pr(3, "a")]);
+        in_main_checkout(&mut app);
         assert!(matches!(
             &app.prompt,
             Some(Prompt::MoveToWorktree { number: 3, main_path, .. }) if main_path == "/src/repo"
@@ -1126,6 +1282,26 @@ pub(crate) mod tests {
         press(&mut app, 'n');
         assert!(app.prompt.is_none());
         assert_eq!(app.flash().unwrap().text, "Left PR #3 in the main checkout");
+        assert!(app.take_jobs().is_empty());
+    }
+
+    #[test]
+    fn accepting_the_move_opens_the_pr_in_a_worktree() {
+        let mut app = app_with(vec![sample_pr(3, "a")]);
+        in_main_checkout(&mut app);
+        press(&mut app, 'y');
+        assert_eq!(
+            app.take_jobs(),
+            [Job::MoveToWorktree {
+                number: 3,
+                branch: "feature".into(),
+                main_path: "/src/repo".into(),
+            }]
+        );
+        assert_eq!(
+            app.flash().unwrap().text,
+            "Switching the main checkout to main…"
+        );
     }
 
     #[test]
@@ -1145,6 +1321,22 @@ pub(crate) mod tests {
         press(&mut app, 'n');
         assert!(app.prompt.is_none());
         assert_eq!(app.flash().unwrap().text, "Kept the worktree for PR #3");
+        assert!(app.take_jobs().is_empty());
+
+        press(&mut app, 'W');
+        press(&mut app, 'y');
+        assert_eq!(
+            app.take_jobs(),
+            [Job::RemoveWorktree {
+                subject: "PR #3".into(),
+                branch: "feature".into(),
+                path: "/src/repo.feature".into(),
+            }]
+        );
+        assert_eq!(
+            app.flash().unwrap().text,
+            "Removing the worktree for PR #3…"
+        );
     }
 
     #[test]
@@ -1253,6 +1445,104 @@ pub(crate) mod tests {
         press_key(&mut app, KeyCode::Enter);
         assert!(app.flash().is_none());
         assert!(app.prompt.is_none());
+        assert!(app.take_jobs().is_empty());
+    }
+
+    #[test]
+    fn row_keys_queue_their_actions() {
+        let mut app = app_with(vec![sample_pr(3, "a")]);
+        app.claude_review_label = Some(claude_label());
+        app.set_worktrees(vec![sample_worktree("me/a", Progress::Empty)]);
+
+        press(&mut app, 'o');
+        assert_eq!(app.take_jobs(), [Job::OpenInBrowser { number: 3 }]);
+        press_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.take_jobs(), [Job::OpenInBrowser { number: 3 }]);
+
+        press(&mut app, 'c');
+        assert_eq!(app.take_jobs(), [Job::Checkout { number: 3 }]);
+        assert_eq!(app.flash().unwrap().text, "Checking out #3…");
+
+        press(&mut app, 'w');
+        assert_eq!(
+            app.take_jobs(),
+            [Job::OpenPr {
+                number: 3,
+                branch: "feature".into(),
+            }]
+        );
+        assert_eq!(app.flash().unwrap().text, "Opening PR #3 in a worktree…");
+
+        press(&mut app, 'l');
+        assert_eq!(
+            app.take_jobs(),
+            [Job::AddClaudeReview {
+                number: 3,
+                label: claude_label(),
+            }]
+        );
+        assert_eq!(app.adding_claude_review, HashSet::from([3]));
+
+        press(&mut app, 'j');
+        press(&mut app, 'w');
+        assert_eq!(
+            app.take_jobs(),
+            [Job::OpenBranch {
+                branch: "me/a".into(),
+                path: "/src/repo.me-a".into(),
+            }]
+        );
+        assert_eq!(app.flash().unwrap().text, "Opening me/a…");
+    }
+
+    #[test]
+    fn refresh_runs_one_fetch_at_a_time() {
+        let mut app = app_with(vec![sample_pr(1, "a")]);
+        press(&mut app, 'r');
+        assert_eq!(app.take_jobs(), [Job::FetchPrs, Job::CurrentBranch]);
+        assert!(app.loading_since.is_some());
+        press(&mut app, 'r');
+        assert!(app.take_jobs().is_empty());
+
+        app.on_msg(snapshot(vec![sample_pr(1, "a")]));
+        assert!(app.loading_since.is_none());
+        // A fetch that started before the label landed would drop it.
+        app.adding_claude_review.insert(1);
+        press(&mut app, 'r');
+        assert!(app.take_jobs().is_empty());
+        assert!(app.loading_since.is_none());
+
+        app.adding_claude_review.clear();
+        press(&mut app, 'r');
+        assert_eq!(app.take_jobs(), [Job::FetchPrs, Job::CurrentBranch]);
+    }
+
+    #[test]
+    fn finished_actions_refresh_what_they_changed() {
+        let mut app = app_with(vec![sample_pr(3, "a")]);
+        app.on_msg(Msg::CheckedOut(3, Ok(Checkout::Done(String::new()))));
+        assert_eq!(app.take_jobs(), [Job::CurrentBranch]);
+
+        let opened = || OpenedWorktree {
+            path: "/src/repo.feature".into(),
+            workspace: worktree::Workspace::Opened,
+        };
+        app.on_msg(Msg::OpenedWorktree(3, Ok(OpenOutcome::Opened(opened()))));
+        assert_eq!(app.take_jobs(), [Job::ListWorktrees, Job::CurrentBranch]);
+
+        app.on_msg(Msg::OpenedBranch("me/a".into(), Ok(opened())));
+        assert_eq!(app.take_jobs(), [Job::ListWorktrees]);
+
+        app.on_msg(Msg::RemovedWorktree("me/a".into(), Ok(false)));
+        assert_eq!(app.take_jobs(), [Job::ListWorktrees]);
+
+        // Failures change nothing locally, so there's nothing to refresh.
+        app.on_msg(Msg::CheckedOut(3, Err(anyhow::anyhow!("gh failed"))));
+        app.on_msg(Msg::RemovedWorktree(
+            "me/a".into(),
+            Err(anyhow::anyhow!("no")),
+        ));
+        assert!(app.take_jobs().is_empty());
     }
 
     #[test]
@@ -1268,6 +1558,19 @@ pub(crate) mod tests {
         press(&mut app, 'n');
         assert!(app.prompt.is_none());
         assert_eq!(app.flash().unwrap().text, "Kept the worktree for me/a");
+        assert!(app.take_jobs().is_empty());
+
+        press(&mut app, 'W');
+        press(&mut app, 'y');
+        assert_eq!(
+            app.take_jobs(),
+            [Job::RemoveWorktree {
+                subject: "me/a".into(),
+                branch: "me/a".into(),
+                path: "/src/repo.me-a".into(),
+            }]
+        );
+        assert_eq!(app.flash().unwrap().text, "Removing the worktree for me/a…");
     }
 
     #[test]
@@ -1297,6 +1600,28 @@ pub(crate) mod tests {
         assert!(app.new_branch.is_none());
         assert!(!app.should_quit);
         assert!(app.flash().is_none());
+        assert!(app.take_jobs().is_empty());
+    }
+
+    #[test]
+    fn new_branch_input_creates_the_previewed_branch() {
+        let mut app = app_with(vec![]);
+        press(&mut app, 'n');
+        for c in "Fix \"flaky\" CI".chars() {
+            press(&mut app, c);
+        }
+        press_key(&mut app, KeyCode::Enter);
+        assert!(app.new_branch.is_none());
+        assert_eq!(
+            app.take_jobs(),
+            [Job::CreateBranch {
+                branch: "me/fix-flaky-ci".into(),
+            }]
+        );
+        assert_eq!(
+            app.flash().unwrap().text,
+            "Creating me/fix-flaky-ci from origin/main…"
+        );
     }
 
     #[test]
@@ -1312,9 +1637,6 @@ pub(crate) mod tests {
         assert!(app.flash().unwrap().text.contains("already exists"));
     }
 
-    // Pull tests never press `p` on the default branch: that would fetch and
-    // merge in whatever checkout the tests run from.
-
     #[test]
     fn pull_is_offered_only_on_the_default_branch() {
         let mut app = app_with(vec![]);
@@ -1327,14 +1649,18 @@ pub(crate) mod tests {
         assert!(!app.can_pull());
         press(&mut app, 'p');
         assert!(app.flash().is_none());
+        assert!(app.take_jobs().is_empty());
 
         app.on_msg(Msg::Branch(Ok("main".into())));
         assert!(app.can_pull());
+        press(&mut app, 'p');
+        assert!(app.pulling);
+        assert_eq!(app.take_jobs(), [Job::PullDefaultBranch]);
+        assert_eq!(app.flash().unwrap().text, "Pulling main from origin…");
         // Not while a pull is already running.
-        app.pulling = true;
         assert!(!app.can_pull());
         press(&mut app, 'p');
-        assert!(app.flash().is_none());
+        assert!(app.take_jobs().is_empty());
 
         app.on_msg(Msg::Branch(Err(anyhow::anyhow!("not a git repository"))));
         assert_eq!(app.current_branch, None);
@@ -1347,12 +1673,16 @@ pub(crate) mod tests {
         app.on_msg(Msg::PulledDefaultBranch(Ok(Some(0))));
         assert!(!app.pulling);
         assert_eq!(app.flash().unwrap().text, "main is up to date");
+        assert!(app.take_jobs().is_empty());
 
+        // New commits change how far ahead each worktree is.
         app.on_msg(Msg::PulledDefaultBranch(Ok(Some(1))));
         assert_eq!(app.flash().unwrap().text, "Pulled 1 new commit into main");
+        assert_eq!(app.take_jobs(), [Job::ListWorktrees]);
         app.on_msg(Msg::PulledDefaultBranch(Ok(Some(3))));
         assert_eq!(app.flash().unwrap().text, "Pulled 3 new commits into main");
         assert!(!app.flash().unwrap().is_error);
+        assert_eq!(app.take_jobs(), [Job::ListWorktrees]);
     }
 
     #[test]
@@ -1548,6 +1878,7 @@ pub(crate) mod tests {
         let flash = app.flash().unwrap();
         assert!(!flash.is_error);
         assert_eq!(flash.text, "Not on main, so nothing was pulled");
+        assert_eq!(app.take_jobs(), [Job::CurrentBranch]);
     }
 
     #[test]
