@@ -337,7 +337,6 @@ impl App {
             Msg::Prs(result, worktrees) => {
                 self.loading_since = None;
                 self.last_attempt = Some(Instant::now());
-                self.set_worktrees(worktrees);
                 match result {
                     Ok(mut snapshot) => {
                         let listed: HashSet<u64> =
@@ -363,6 +362,9 @@ impl App {
                         self.load_error = Some(text);
                     }
                 }
+                // After the PRs, so the first load selects the first PR
+                // rather than the first worktree.
+                self.set_worktrees(worktrees);
                 self.claude_review_updates.clear();
             }
             Msg::ClaudeReviewAdded(number, label, result) => {
@@ -1156,6 +1158,21 @@ pub(crate) mod tests {
             worktrees,
         ));
         assert_eq!(app.worktree_for(&app.prs[0]), Some("/src/repo.feature"));
+    }
+
+    #[test]
+    fn first_load_selects_the_first_pr_over_worktrees() {
+        let mut app = unloaded_app();
+        app.on_msg(Msg::Prs(
+            Ok(PrSnapshot {
+                prs: vec![sample_pr(1, "a"), sample_pr(2, "b")],
+                claude_review_label: None,
+                merge_method: MergeMethod::Merge,
+            }),
+            vec![sample_worktree("me/a", Progress::Empty)],
+        ));
+        assert_eq!(app.selected_pr().unwrap().number, 1);
+        assert_eq!(app.local_list.selected(), None);
     }
 
     #[test]
